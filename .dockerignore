@@ -1,0 +1,8 @@
+.git
+__pycache__
+*.pyc
+.pytest_cache
+tests
+README.md
+docker-compose.yml
+.dockerignore

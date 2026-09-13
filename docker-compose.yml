@@ -1,0 +1,25 @@
+# 仅运行 API 与一次性验收服务，无数据库等其他组件。
+# 宿主端口可用 API_PORT 覆盖：API_PORT=9000 docker compose up api
+services:
+  api:
+    build: .
+    image: mortar-correction-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    image: mortar-correction-api
+    build: .
+    command: ["python", "verify.py"]
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
