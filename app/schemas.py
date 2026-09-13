@@ -5,16 +5,14 @@
 - 吸水率 absorption_pct: 0 ~ 15（质量百分数）
 - 所有质量（干基目标质量、设计加水量）必须大于零，单位 kg
 - 骨料数量 1 ~ 8 种
+
+小数位数不限：高精度输入一律受理，仅按上述有效范围校验。
 """
 from __future__ import annotations
 
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
-
-# 输入精度护栏：防止天文数字打爆 Decimal 上下文，同时保留 6 位小数输入精度
-MAX_DIGITS = 14
-DECIMAL_PLACES = 6
 
 MOISTURE_MIN = Decimal("0")
 MOISTURE_MAX = Decimal("40")
@@ -33,23 +31,17 @@ class AggregateIn(BaseModel):
     name: str = Field(min_length=1, max_length=64, description="骨料名称")
     dry_mass_kg: Decimal = Field(
         gt=0,
-        max_digits=MAX_DIGITS,
-        decimal_places=DECIMAL_PLACES,
-        description="干基目标质量（kg），必须大于零",
+        description="干基目标质量（kg），必须大于零，小数位数不限",
     )
     moisture_pct: Decimal = Field(
         ge=MOISTURE_MIN,
         le=MOISTURE_MAX,
-        max_digits=MAX_DIGITS,
-        decimal_places=DECIMAL_PLACES,
-        description="含水率（质量百分数），0 ~ 40，端点包含",
+        description="含水率（质量百分数），0 ~ 40，端点包含，小数位数不限",
     )
     absorption_pct: Decimal = Field(
         ge=ABSORPTION_MIN,
         le=ABSORPTION_MAX,
-        max_digits=MAX_DIGITS,
-        decimal_places=DECIMAL_PLACES,
-        description="吸水率（质量百分数），0 ~ 15，端点包含",
+        description="吸水率（质量百分数），0 ~ 15，端点包含，小数位数不限",
     )
 
 
@@ -58,9 +50,7 @@ class CorrectionRequest(BaseModel):
 
     design_water_kg: Decimal = Field(
         gt=0,
-        max_digits=MAX_DIGITS,
-        decimal_places=DECIMAL_PLACES,
-        description="设计加水量（kg），必须大于零",
+        description="设计加水量（kg），必须大于零，小数位数不限",
     )
     aggregates: list[AggregateIn] = Field(
         min_length=MIN_AGGREGATES,

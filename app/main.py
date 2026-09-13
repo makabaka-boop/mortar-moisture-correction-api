@@ -31,8 +31,6 @@ _MESSAGE_MAP = {
     "too_long": "数量或长度超限，最多允许 {max_length}",
     "missing": "缺少必填字段",
     "decimal_parsing": "不是合法的十进制数",
-    "decimal_max_digits": "数字位数超限",
-    "decimal_max_places": "小数位数超限",
     "string_type": "必须是字符串",
     "list_type": "必须是数组",
 }

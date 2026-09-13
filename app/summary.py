@@ -17,10 +17,11 @@ _ZERO = Decimal("0")
 def round3(value: Decimal) -> Decimal:
     """按 ROUND_HALF_UP 保留三位小数（负数按绝对值远离零方向进位）。
 
-    临时提升上下文精度，保证大数值 quantize 不抛 InvalidOperation。
+    上下文精度按值的量级自适应（整数位 + 3 位小数 + 1 位余量），
+    保证任意大小/精度的值 quantize 都不抛 InvalidOperation。
     """
     with localcontext() as ctx:
-        ctx.prec = max(28, len(value.as_tuple().digits) + 6)
+        ctx.prec = max(28, value.adjusted() + 4)
         return value.quantize(THREE_PLACES, rounding=ROUND_HALF_UP)
 
 

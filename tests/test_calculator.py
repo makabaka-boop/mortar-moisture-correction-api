@@ -1,5 +1,5 @@
 """修正计算模块的公式与精度测试。"""
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -102,3 +102,27 @@ class TestCorrectBatch:
         batch = correct_batch(Decimal("1"), [_Agg("粉", dry, "40", "15")])
         expected_free = Decimal(dry) * Decimal("25") / Decimal("100")
         assert batch.items[0].free_water_kg == expected_free
+
+    def test_precision_beyond_28_digits_not_truncated(self):
+        # 31 位有效数字：默认 28 位上下文会丢尾数，批量计算必须完整保留
+        dry = "1.0000000000000000000000000001"
+        batch = correct_batch(Decimal("1"), [_Agg("砂", dry, "0", "0")])
+        assert batch.items[0].wet_mass_kg == Decimal(dry)
+
+    def test_high_precision_product_exact(self):
+        dry = Decimal("3.141592653589793238462643383")
+        with localcontext() as ctx:
+            ctx.prec = 60
+            expected_wet = dry * Decimal("1.025")
+            expected_free = dry * Decimal("0.025")
+        batch = correct_batch(Decimal("0.5"), [_Agg("砂", str(dry), "2.5", "0")])
+        assert batch.items[0].wet_mass_kg == expected_wet
+        assert batch.items[0].free_water_kg == expected_free
+
+    def test_many_decimal_place_rates_accepted(self):
+        # 高精度百分率按有效范围受理并精确计算
+        batch = correct_batch(
+            Decimal("10"), [_Agg("砂", "100", "5.1234567890123", "0.0000000000001")]
+        )
+        assert batch.items[0].wet_mass_kg == Decimal("105.1234567890123")
+        assert batch.items[0].free_water_kg == Decimal("5.1234567890122")

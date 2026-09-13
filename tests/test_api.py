@@ -169,6 +169,54 @@ class TestNegativeFinalWater:
         assert resp.status_code == 422
 
 
+class TestHighPrecisionInputs:
+    """高精度输入按有效范围受理，不再因小数位数被拒。"""
+
+    def test_high_precision_percent_accepted(self):
+        resp = client.post(URL, json=_payload([_agg(dry="100", moisture="5.1234567890123", absorption="0")]))
+        assert resp.status_code == 200
+        # 湿投料量 = 100 × 1.051234567890123 = 105.1234567890123 → 105.123
+        assert resp.json()["items"][0]["wet_mass_kg"] == "105.123"
+
+    def test_high_precision_masses_accepted(self):
+        resp = client.post(
+            URL,
+            json=_payload(
+                [_agg(dry="0.123456789012345678", moisture="0", absorption="0")],
+                design="0.000000001",
+            ),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["items"][0]["wet_mass_kg"] == "0.123"
+        assert body["final_water_kg"] == "0.000"  # 0.000000001 舍入后显示，本身合法
+
+    def test_many_decimal_places_regression(self):
+        # 回归：此前 decimal_places=6 护栏会把这类输入误判为 422
+        resp = client.post(
+            URL,
+            json=_payload([_agg(dry="10.123456789", moisture="1.111111111", absorption="0.000000001")]),
+        )
+        assert resp.status_code == 200
+
+    @pytest.mark.parametrize("moisture", ["40.0000001", "40.0000000000001"])
+    def test_moisture_beyond_range_still_rejected(self, moisture):
+        resp = client.post(URL, json=_payload([_agg(moisture=moisture)]))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "aggregates[0].moisture_pct"
+
+    @pytest.mark.parametrize("absorption", ["15.0000001", "15.0000000000001"])
+    def test_absorption_beyond_range_still_rejected(self, absorption):
+        resp = client.post(URL, json=_payload([_agg(absorption=absorption)]))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "aggregates[0].absorption_pct"
+
+    def test_boundary_with_high_precision_accepted(self):
+        # 端点值本身带高精度小数位也合法
+        resp = client.post(URL, json=_payload([_agg(moisture="40.0000000000000", absorption="15.0000000000000")]))
+        assert resp.status_code == 200
+
+
 class TestHealth:
     def test_health(self):
         resp = client.get("/health")

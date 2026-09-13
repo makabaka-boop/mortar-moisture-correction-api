@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Protocol, Sequence
 
 _HUNDRED = Decimal("100")
@@ -76,24 +76,40 @@ def correct_aggregate(
     )
 
 
+def _required_precision(design_water_kg: Decimal, aggregates: Sequence[AggregateLike]) -> int:
+    """按输入有效位数估算精确计算所需的上下文精度。
+
+    乘积的有效位数不超过乘数位数之和，8 项求和至多再增加 1 位，
+    另加 16 位余量；保证任意高精度输入的中间值都不被上下文截断。
+    """
+    digits = len(design_water_kg.as_tuple().digits)
+    for agg in aggregates:
+        digits += len(agg.dry_mass_kg.as_tuple().digits)
+        digits += len(agg.moisture_pct.as_tuple().digits)
+        digits += len(agg.absorption_pct.as_tuple().digits)
+    return max(28, digits + 16)
+
+
 def correct_batch(
     design_water_kg: Decimal, aggregates: Sequence[AggregateLike]
 ) -> BatchCorrection:
     """整批修正：逐项计算后汇总自由水量，得到最终加水量。"""
-    items = tuple(
-        correct_aggregate(
-            index=i,
-            name=agg.name,
-            dry_mass_kg=agg.dry_mass_kg,
-            moisture_pct=agg.moisture_pct,
-            absorption_pct=agg.absorption_pct,
+    with localcontext() as ctx:
+        ctx.prec = _required_precision(design_water_kg, aggregates)
+        items = tuple(
+            correct_aggregate(
+                index=i,
+                name=agg.name,
+                dry_mass_kg=agg.dry_mass_kg,
+                moisture_pct=agg.moisture_pct,
+                absorption_pct=agg.absorption_pct,
+            )
+            for i, agg in enumerate(aggregates)
         )
-        for i, agg in enumerate(aggregates)
-    )
-    total_free_water = sum((item.free_water_kg for item in items), _ZERO)
-    return BatchCorrection(
-        items=items,
-        design_water_kg=design_water_kg,
-        total_free_water_kg=total_free_water,
-        final_water_kg=design_water_kg - total_free_water,
-    )
+        total_free_water = sum((item.free_water_kg for item in items), _ZERO)
+        return BatchCorrection(
+            items=items,
+            design_water_kg=design_water_kg,
+            total_free_water_kg=total_free_water,
+            final_water_kg=design_water_kg - total_free_water,
+        )
