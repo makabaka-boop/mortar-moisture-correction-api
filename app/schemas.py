@@ -5,6 +5,7 @@
 - 吸水率 absorption_pct: 0 ~ 15（质量百分数）
 - 所有质量（干基目标质量、设计加水量）必须大于零，单位 kg
 - 骨料数量 1 ~ 8 种
+- 目标干料总量 target_dry_total_kg 可选，传入时必须大于零
 
 小数位数不限：高精度输入一律受理，仅按上述有效范围校验。
 """
@@ -46,11 +47,19 @@ class AggregateIn(BaseModel):
 
 
 class CorrectionRequest(BaseModel):
-    """修正单请求：设计加水量 + 1~8 种骨料。"""
+    """修正单请求：设计加水量 + 1~8 种骨料，可选目标干料总量。"""
 
     design_water_kg: Decimal = Field(
         gt=0,
         description="设计加水量（kg），必须大于零，小数位数不限",
+    )
+    target_dry_total_kg: Decimal | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "目标干料总量（kg），可选，必须大于零；传入后以原骨料干基合计为基准"
+            "求缩放系数，同比缩放各项干基质量与设计加水量"
+        ),
     )
     aggregates: list[AggregateIn] = Field(
         min_length=MIN_AGGREGATES,
@@ -103,7 +112,11 @@ class AggregateCorrectionOut(BaseModel):
 
 
 class CorrectionSheetOut(BaseModel):
-    """修正单响应：逐项结果 + 批次汇总（质量均为三位小数字符串）。"""
+    """修正单响应：逐项结果 + 批次汇总（质量均为三位小数字符串）。
+
+    仅在请求传入目标干料总量时，响应才携带 target_dry_total_kg 与
+    scale_factor（由端点以 exclude_none 序列化保证未传时响应原样）。
+    """
 
     items: list[AggregateCorrectionOut]
     item_count: int = Field(description="骨料种类数")
@@ -112,6 +125,13 @@ class CorrectionSheetOut(BaseModel):
     total_free_water_kg: Decimal = Field(description="自由水量合计（kg）")
     design_water_kg: Decimal = Field(description="设计加水量（kg）")
     final_water_kg: Decimal = Field(description="最终加水量（kg），>= 0")
+    target_dry_total_kg: Decimal | None = Field(
+        default=None, description="目标干料总量（kg），三位小数"
+    )
+    scale_factor: Decimal | None = Field(
+        default=None,
+        description="缩放系数 = 目标干料总量 / 原骨料干基合计，ROUND_HALF_UP 保留六位小数",
+    )
 
     @field_serializer(
         "total_dry_mass_kg",
@@ -122,3 +142,7 @@ class CorrectionSheetOut(BaseModel):
     )
     def _ser_decimal(self, value: Decimal) -> str:
         return _decimal_to_str(value)
+
+    @field_serializer("target_dry_total_kg", "scale_factor")
+    def _ser_optional_decimal(self, value: Decimal | None) -> str | None:
+        return None if value is None else _decimal_to_str(value)

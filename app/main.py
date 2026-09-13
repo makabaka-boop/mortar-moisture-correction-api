@@ -86,14 +86,19 @@ def health() -> dict[str, str]:
 @app.post(
     "/api/v1/correction-sheet",
     response_model=CorrectionSheetOut,
+    # 未传目标干料总量时剔除 target_dry_total_kg / scale_factor，响应保持原样
+    response_model_exclude_none=True,
     summary="生成砂浆含水修正单",
 )
 def correction_sheet(payload: CorrectionRequest) -> CorrectionSheetOut | JSONResponse:
     """按干配方与各骨料含水/吸水率计算湿投料清单与最终加水量。
 
+    传入目标干料总量时，以原骨料干基合计为基准同比缩放全单。
     最终加水量为零合法；小于零时以 422 整体拒绝，不返回部分修正单。
     """
-    correction = correct_batch(payload.design_water_kg, payload.aggregates)
+    correction = correct_batch(
+        payload.design_water_kg, payload.aggregates, payload.target_dry_total_kg
+    )
     if correction.final_water_kg < 0:
         detail = [
             {

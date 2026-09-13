@@ -143,3 +143,74 @@ class TestCorrectBatch:
         batch = correct_batch(Decimal("1e30"), aggs)
         assert batch.total_free_water_kg == Decimal("8")
         assert batch.final_water_kg == Decimal("999999999999999999999999999992")
+
+
+class TestCorrectBatchWithTarget:
+    """传入目标干料总量：以原干基合计为基准求缩放系数，同比缩放全单。"""
+
+    def test_scale_up_two_aggregates(self):
+        aggs = [_Agg("砂A", "800", "5.0", "1.0"), _Agg("砂B", "200", "1.0", "0.0")]
+        # 原干基合计 1000，目标 2500 → 缩放系数 2.5
+        batch = correct_batch(Decimal("180"), aggs, target_dry_total_kg=Decimal("2500"))
+        assert batch.target_dry_total_kg == Decimal("2500")
+        assert batch.scale_factor == Decimal("2.5")
+        assert [it.dry_mass_kg for it in batch.items] == [Decimal("2000"), Decimal("500")]
+        assert [it.wet_mass_kg for it in batch.items] == [Decimal("2100"), Decimal("505")]
+        assert [it.free_water_kg for it in batch.items] == [Decimal("80"), Decimal("5")]
+        assert batch.design_water_kg == Decimal("450")
+        assert batch.total_free_water_kg == Decimal("85")
+        assert batch.final_water_kg == Decimal("365")
+
+    def test_omitted_target_leaves_batch_unscaled(self):
+        aggs = [_Agg("砂", "800", "5", "1")]
+        batch = correct_batch(Decimal("180"), aggs)
+        assert batch.target_dry_total_kg is None
+        assert batch.scale_factor is None
+        assert batch.items[0].dry_mass_kg == Decimal("800")
+        assert batch.design_water_kg == Decimal("180")
+        assert batch.final_water_kg == Decimal("148")
+
+    def test_scale_down_absorbing_aggregate_raises_final_water(self):
+        # 吸水骨料（free = −3）：目标减半后 free = −1.5，
+        # 最终加水量 6.5 仍高于缩放后的设计加水量 5
+        aggs = [_Agg("砂", "100", "1", "4")]
+        batch = correct_batch(Decimal("10"), aggs, target_dry_total_kg=Decimal("50"))
+        assert batch.scale_factor == Decimal("0.5")
+        assert batch.items[0].dry_mass_kg == Decimal("50")
+        assert batch.items[0].free_water_kg == Decimal("-1.5")
+        assert batch.design_water_kg == Decimal("5")
+        assert batch.final_water_kg == Decimal("6.5")
+
+    def test_scaled_values_keep_full_precision(self):
+        # 缩放系数 123.456/1600 = 0.07716：缩放值不提前舍入，直接进入既有公式
+        aggs = [_Agg("砂", "800", "5", "1"), _Agg("粉", "800", "0.5", "0.2")]
+        batch = correct_batch(Decimal("180"), aggs, target_dry_total_kg=Decimal("123.456"))
+        assert batch.scale_factor == Decimal("0.07716")
+        assert batch.items[0].dry_mass_kg == Decimal("61.728")
+        # free = 61.728 × (5 − 1)/100 = 2.46912，完整保留
+        assert batch.items[0].free_water_kg == Decimal("2.46912")
+        # free = 61.728 × (0.5 − 0.2)/100 = 0.185184
+        assert batch.items[1].free_water_kg == Decimal("0.185184")
+        # design = 180 × 0.07716 = 13.8888；final = 13.8888 − 2.654304
+        assert batch.design_water_kg == Decimal("13.8888")
+        assert batch.final_water_kg == Decimal("11.234496")
+
+    def test_high_precision_target_and_factor_exact(self):
+        # 目标与系数均为高精度小数：乘积在自适应上下文精度下逐位精确
+        dry = "1.0000000000000000000000000001"  # 31 位有效数字
+        target = "3.0000000000000000000000000003"  # k = 3 精确
+        batch = correct_batch(
+            Decimal("0.5"), [_Agg("砂", dry, "0", "0")], target_dry_total_kg=Decimal(target)
+        )
+        assert batch.scale_factor == Decimal("3")
+        assert batch.items[0].dry_mass_kg == Decimal(target)
+
+    def test_huge_design_water_scaled_up_keeps_fraction(self):
+        # 缩放放大巨大设计加水量后，微小自由水的扣除仍不被精度吞掉
+        batch = correct_batch(
+            Decimal("1e28"),
+            [_Agg("砂", "60", "1", "0")],
+            target_dry_total_kg=Decimal("120"),
+        )
+        assert batch.scale_factor == Decimal("2")
+        assert batch.final_water_kg == Decimal("19999999999999999999999999998.8")

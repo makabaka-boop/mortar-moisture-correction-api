@@ -27,11 +27,27 @@
 - 自由水量可为负（吸水率高于含水率时骨料反而吸水，最终加水量因此上调）；
 - 最终加水量为 **0 合法**；**小于 0 则以 422 整体拒绝，不返回部分修正单**（判定基于完整精度）。
 
+### 可选：目标干料总量同比缩放
+
+请求传入可选的 `target_dry_total_kg` 时，以原骨料干基合计为基准求唯一缩放系数，
+同比缩放各项干基质量与设计加水量，缩放值保持完整精度进入上述固定公式：
+
+```
+缩放系数 = 目标干料总量 / 原骨料干基合计
+各项干基质量′ = 各项干基质量 × 缩放系数
+设计加水量′  = 设计加水量 × 缩放系数
+```
+
+响应补充 `target_dry_total_kg`（三位小数）与 `scale_factor`
+（**ROUND_HALF_UP 保留六位小数**）；未传该参数时响应不含这两个字段，计算与原样完全一致。
+缩放后的最终加水量小于零时同样以 422 整单拒绝。
+
 ## 输入约束（端点均包含）
 
 | 字段 | 约束 |
 | --- | --- |
 | `design_water_kg` | 质量（kg），> 0 |
+| `target_dry_total_kg` | 可选；传入时为目标干料总量（kg），> 0 |
 | `aggregates` | 数组，1 ~ 8 种骨料 |
 | `aggregates[i].name` | 非空字符串，≤ 64 字符 |
 | `aggregates[i].dry_mass_kg` | 干基目标质量（kg），> 0 |
@@ -76,6 +92,40 @@
 }
 ```
 
+传入 `target_dry_total_kg` 的缩放请求示例：
+
+```json
+{
+  "design_water_kg": "180",
+  "target_dry_total_kg": "3200",
+  "aggregates": [
+    {"name": "河砂A", "dry_mass_kg": "800", "moisture_pct": "5.0", "absorption_pct": "1.0"},
+    {"name": "机制砂B", "dry_mass_kg": "600", "moisture_pct": "3.5", "absorption_pct": "0.5"},
+    {"name": "石粉", "dry_mass_kg": "200", "moisture_pct": "0.5", "absorption_pct": "0.2"}
+  ]
+}
+```
+
+对应响应在原字段基础上补充目标与缩放系数（全单同比放大 2 倍）：
+
+```json
+{
+  "items": [
+    {"index": 0, "name": "河砂A", "dry_mass_kg": "1600.000", "wet_mass_kg": "1680.000", "free_water_kg": "64.000"},
+    {"index": 1, "name": "机制砂B", "dry_mass_kg": "1200.000", "wet_mass_kg": "1242.000", "free_water_kg": "36.000"},
+    {"index": 2, "name": "石粉", "dry_mass_kg": "400.000", "wet_mass_kg": "402.000", "free_water_kg": "1.200"}
+  ],
+  "item_count": 3,
+  "total_dry_mass_kg": "3200.000",
+  "total_wet_mass_kg": "3324.000",
+  "total_free_water_kg": "101.200",
+  "design_water_kg": "360.000",
+  "final_water_kg": "258.800",
+  "target_dry_total_kg": "3200.000",
+  "scale_factor": "2.000000"
+}
+```
+
 ### `GET /health`
 
 返回 `{"status": "ok"}`，用于容器健康检查。
@@ -98,12 +148,12 @@
 
 ```
 app/
-├── schemas.py     # 请求校验：Pydantic 契约（范围、质量>0、1~8 种骨料）
-├── calculator.py  # 修正计算：纯 Decimal 公式，中间值完整精度
-├── summary.py     # 批次汇总：ROUND_HALF_UP 三位小数舍入与响应组装
+├── schemas.py     # 请求校验：Pydantic 契约（范围、质量>0、1~8 种骨料、可选目标干料总量）
+├── calculator.py  # 修正计算：纯 Decimal 公式，可选同比缩放，中间值完整精度
+├── summary.py     # 批次汇总：ROUND_HALF_UP 三位小数（缩放系数六位）舍入与响应组装
 └── main.py        # FastAPI 装配：端点与统一 422 错误反馈
-tests/             # pytest：公式、舍入、边界、错误定位、整单拒绝
-verify.py          # 一次性验收：多骨料样例独立复算并比对
+tests/             # pytest：公式、舍入、边界、错误定位、整单拒绝、目标干料总量缩放
+verify.py          # 一次性验收：原样例与缩放样例独立复算并比对
 ```
 
 ## 本地运行
@@ -127,5 +177,6 @@ docker compose up verify                 # 一次性验收：起 API → 跑多�
 docker compose run --rm verify           # 等价的一次性运行方式
 ```
 
-`verify` 服务等待 `api` 健康后提交三骨料样例，独立复算并比对响应，
-成功时打印唯一的湿投料清单与三位小数最终加水量，退出码 0；不一致则退出码 1。
+`verify` 服务等待 `api` 健康后，先提交未传目标干料总量的三骨料样例、再提交
+`target_dry_total_kg: "3200"` 的缩放样例，均独立复算并比对响应，
+成功时打印湿投料清单与三位小数最终加水量，退出码 0；不一致则退出码 1。

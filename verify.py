@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""一次性验收服务：向 API 提交多骨料样例，校验并打印湿投料清单与最终加水量。
+"""一次性验收服务：向 API 提交样例，校验并打印湿投料清单与最终加水量。
+
+覆盖两类样例：
+1. 未传目标干料总量的多骨料样例 —— 响应须与独立复算完全一致；
+2. 传入目标干料总量的缩放样例 —— 以原骨料干基合计为基准同比缩放，
+   响应（含三位小数目标与六位缩放系数）同样独立复算比对。
 
 用法：
     python verify.py                 # 默认打 http://localhost:8000
@@ -13,7 +18,7 @@ import json
 import os
 import sys
 import time
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import httpx
 
@@ -32,22 +37,42 @@ SAMPLE = {
     ],
 }
 
+# 目标干料总量缩放样例：原干基合计 1600 → 目标 3200，缩放系数 2
+SCALED_SAMPLE = {
+    **SAMPLE,
+    "target_dry_total_kg": "3200",
+}
+
 Q3 = Decimal("0.001")
+Q6 = Decimal("0.000001")
 
 
 def round3(value: Decimal) -> Decimal:
-    return value.quantize(Q3)
+    return value.quantize(Q3, rounding=ROUND_HALF_UP)
+
+
+def round6(value: Decimal) -> Decimal:
+    return value.quantize(Q6, rounding=ROUND_HALF_UP)
 
 
 def expected_sheet(sample: dict) -> dict:
     """用 Decimal 独立复算期望值（与 API 实现互不复用代码）。"""
+    target = sample.get("target_dry_total_kg")
+    factor = None
+    if target is not None:
+        base_total = sum(Decimal(a["dry_mass_kg"]) for a in sample["aggregates"])
+        factor = Decimal(target) / base_total
     items = []
     total_free = Decimal("0")
     total_wet = Decimal("0")
+    total_dry = Decimal("0")
     for i, agg in enumerate(sample["aggregates"]):
         dry = Decimal(agg["dry_mass_kg"])
+        if factor is not None:
+            dry = dry * factor
         wet = dry * (1 + Decimal(agg["moisture_pct"]) / 100)
         free = dry * (Decimal(agg["moisture_pct"]) - Decimal(agg["absorption_pct"])) / 100
+        total_dry += dry
         total_free += free
         total_wet += wet
         items.append(
@@ -60,15 +85,21 @@ def expected_sheet(sample: dict) -> dict:
             }
         )
     design = Decimal(sample["design_water_kg"])
-    return {
+    if factor is not None:
+        design = design * factor
+    body = {
         "items": items,
         "item_count": len(items),
-        "total_dry_mass_kg": f"{round3(sum(Decimal(a['dry_mass_kg']) for a in sample['aggregates'])):f}",
+        "total_dry_mass_kg": f"{round3(total_dry):f}",
         "total_wet_mass_kg": f"{round3(total_wet):f}",
         "total_free_water_kg": f"{round3(total_free):f}",
         "design_water_kg": f"{round3(design):f}",
         "final_water_kg": f"{round3(design - total_free):f}",
     }
+    if target is not None:
+        body["target_dry_total_kg"] = f"{round3(Decimal(target)):f}"
+        body["scale_factor"] = f"{round6(factor):f}"
+    return body
 
 
 def wait_for_api() -> None:
@@ -84,31 +115,50 @@ def wait_for_api() -> None:
     raise SystemExit(f"[verify] FAIL: API 在 {RETRY_SECONDS}s 内未就绪（{API_BASE_URL}）")
 
 
-def main() -> int:
-    wait_for_api()
-    resp = httpx.post(URL, json=SAMPLE, timeout=TIMEOUT)
+def check(sample: dict, label: str) -> dict | None:
+    """提交样例并与独立复算结果比对；通过返回响应体，失败打印原因并返回 None。"""
+    resp = httpx.post(URL, json=sample, timeout=TIMEOUT)
     if resp.status_code != 200:
-        print(f"[verify] FAIL: HTTP {resp.status_code}: {resp.text}", file=sys.stderr)
-        return 1
+        print(f"[verify] FAIL: {label} HTTP {resp.status_code}: {resp.text}", file=sys.stderr)
+        return None
     actual = resp.json()
-    expected = expected_sheet(SAMPLE)
+    expected = expected_sheet(sample)
     if actual != expected:
-        print("[verify] FAIL: 响应与独立复算结果不一致", file=sys.stderr)
+        print(f"[verify] FAIL: {label} 响应与独立复算结果不一致", file=sys.stderr)
         print("expected:", json.dumps(expected, ensure_ascii=False, indent=2), file=sys.stderr)
         print("actual:  ", json.dumps(actual, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 1
+        return None
+    return actual
 
-    print("[verify] 验收通过 —— 湿投料清单：")
-    for item in actual["items"]:
+
+def print_sheet(sheet: dict) -> None:
+    for item in sheet["items"]:
         print(
             f"  [{item['index']}] {item['name']}: "
             f"湿投料 {item['wet_mass_kg']} kg"
             f"（干基 {item['dry_mass_kg']} kg，自由水 {item['free_water_kg']} kg）"
         )
-    print(f"[verify] 湿投料合计 {actual['total_wet_mass_kg']} kg，"
-          f"自由水量合计 {actual['total_free_water_kg']} kg")
-    print(f"[verify] 最终加水量 {actual['final_water_kg']} kg"
-          f"（设计加水量 {actual['design_water_kg']} kg）")
+    print(f"[verify] 湿投料合计 {sheet['total_wet_mass_kg']} kg，"
+          f"自由水量合计 {sheet['total_free_water_kg']} kg")
+    print(f"[verify] 最终加水量 {sheet['final_water_kg']} kg"
+          f"（设计加水量 {sheet['design_water_kg']} kg）")
+
+
+def main() -> int:
+    wait_for_api()
+
+    actual = check(SAMPLE, "原样例（未传目标干料总量）")
+    if actual is None:
+        return 1
+    scaled = check(SCALED_SAMPLE, "目标干料总量缩放样例")
+    if scaled is None:
+        return 1
+
+    print("[verify] 验收通过 —— 湿投料清单：")
+    print_sheet(actual)
+    print(f"[verify] 目标干料总量 {scaled['target_dry_total_kg']} kg"
+          f"（缩放系数 {scaled['scale_factor']}）—— 缩放后湿投料清单：")
+    print_sheet(scaled)
     return 0
 
 

@@ -1,4 +1,6 @@
 """API 端点测试：契约、边界、错误定位与整单拒绝。"""
+from decimal import Decimal, ROUND_HALF_UP, localcontext
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -20,6 +22,60 @@ def _agg(name="砂", dry="100", moisture="5", absorption="1"):
 
 def _payload(aggs, design="180"):
     return {"design_water_kg": design, "aggregates": aggs}
+
+
+def _expected_sheet(payload):
+    """用 Decimal 独立复算期望响应（不复用 app 的计算/汇总代码）。
+
+    与 verify.py 同一套独立公式：可选目标干料总量 → 缩放系数 → 同比缩放
+    各项干基质量与设计加水量 → 湿投料/自由水/最终加水 → 三位小数展示，
+    缩放系数按 ROUND_HALF_UP 保留六位。
+    """
+    q3, q6 = Decimal("0.001"), Decimal("0.000001")
+
+    def r3(v):
+        return f"{v.quantize(q3, rounding=ROUND_HALF_UP):f}"
+
+    def r6(v):
+        return f"{v.quantize(q6, rounding=ROUND_HALF_UP):f}"
+
+    aggs = payload["aggregates"]
+    target = payload.get("target_dry_total_kg")
+    with localcontext() as ctx:
+        ctx.prec = 60
+        if target is None:
+            factor = None
+            drys = [Decimal(a["dry_mass_kg"]) for a in aggs]
+            design = Decimal(payload["design_water_kg"])
+        else:
+            total_dry = sum(Decimal(a["dry_mass_kg"]) for a in aggs)
+            factor = Decimal(target) / total_dry
+            drys = [Decimal(a["dry_mass_kg"]) * factor for a in aggs]
+            design = Decimal(payload["design_water_kg"]) * factor
+        items, total_free, total_wet = [], Decimal("0"), Decimal("0")
+        for i, (agg, dry) in enumerate(zip(aggs, drys)):
+            moisture, absorption = Decimal(agg["moisture_pct"]), Decimal(agg["absorption_pct"])
+            wet = dry * (1 + moisture / 100)
+            free = dry * (moisture - absorption) / 100
+            total_free += free
+            total_wet += wet
+            items.append(
+                {"index": i, "name": agg["name"], "dry_mass_kg": r3(dry),
+                 "wet_mass_kg": r3(wet), "free_water_kg": r3(free)}
+            )
+        body = {
+            "items": items,
+            "item_count": len(items),
+            "total_dry_mass_kg": r3(sum(drys)),
+            "total_wet_mass_kg": r3(total_wet),
+            "total_free_water_kg": r3(total_free),
+            "design_water_kg": r3(design),
+            "final_water_kg": r3(design - total_free),
+        }
+        if target is not None:
+            body["target_dry_total_kg"] = r3(Decimal(target))
+            body["scale_factor"] = r6(factor)
+        return body
 
 
 class TestHappyPath:
@@ -237,3 +293,106 @@ class TestHealth:
         resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
+
+
+class TestTargetDryTotal:
+    """可选目标干料总量：未传时响应原样，传入后按原干基合计同比缩放全单。"""
+
+    SAMPLE_AGGS = [
+        _agg("河砂A", "800", "5.0", "1.0"),
+        _agg("机制砂B", "600", "3.5", "0.5"),
+        _agg("石粉", "200", "0.5", "0.2"),
+    ]
+
+    def test_omitted_target_response_identical_to_legacy(self):
+        # 未传目标：响应与引入该参数前完全一致，不出现新字段
+        resp = client.post(URL, json=_payload(self.SAMPLE_AGGS))
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "items": [
+                {"index": 0, "name": "河砂A", "dry_mass_kg": "800.000",
+                 "wet_mass_kg": "840.000", "free_water_kg": "32.000"},
+                {"index": 1, "name": "机制砂B", "dry_mass_kg": "600.000",
+                 "wet_mass_kg": "621.000", "free_water_kg": "18.000"},
+                {"index": 2, "name": "石粉", "dry_mass_kg": "200.000",
+                 "wet_mass_kg": "201.000", "free_water_kg": "0.600"},
+            ],
+            "item_count": 3,
+            "total_dry_mass_kg": "1600.000",
+            "total_wet_mass_kg": "1662.000",
+            "total_free_water_kg": "50.600",
+            "design_water_kg": "180.000",
+            "final_water_kg": "129.400",
+        }
+
+    def test_scale_up_multi_aggregate_independently_recomputed(self):
+        # 目标 3200 = 原干基合计 1600 × 2：多骨料结果与独立复算逐项一致
+        payload = _payload(self.SAMPLE_AGGS)
+        payload["target_dry_total_kg"] = "3200"
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == _expected_sheet(payload)
+        assert body["scale_factor"] == "2.000000"
+        assert body["target_dry_total_kg"] == "3200.000"
+
+    def test_scale_up_non_trivial_factor_independently_recomputed(self):
+        # 非整数系数 1234.5/1600 = 0.7715625：缩放值保持完整精度进入既有公式
+        payload = _payload(self.SAMPLE_AGGS)
+        payload["target_dry_total_kg"] = "1234.5"
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == _expected_sheet(payload)
+
+    def test_scale_down_absorbing_aggregate_raises_final_water(self):
+        # 吸水骨料（吸水率 4 > 含水率 1）：目标减半后最终加水量仍高于设计加水量
+        payload = _payload([_agg(dry="100", moisture="1", absorption="4")], design="10")
+        payload["target_dry_total_kg"] = "50"
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == _expected_sheet(payload)
+        assert body["scale_factor"] == "0.500000"
+        assert body["items"][0]["free_water_kg"] == "-1.500"
+        assert body["design_water_kg"] == "5.000"
+        assert body["final_water_kg"] == "6.500"  # 吸水骨料抬高最终加水量
+
+    @pytest.mark.parametrize("target", ["0", "-1", "-0.5"])
+    def test_non_positive_target_rejected(self, target):
+        payload = _payload([_agg()])
+        payload["target_dry_total_kg"] = target
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "target_dry_total_kg"
+
+    @pytest.mark.parametrize("target", ["abc", "1.2.3", "", "1e", "NaN"])
+    def test_unparseable_target_rejected(self, target):
+        payload = _payload([_agg()])
+        payload["target_dry_total_kg"] = target
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "target_dry_total_kg"
+
+    def test_null_target_treated_as_omitted(self):
+        resp = client.post(URL, json=_payload([_agg()], ) | {"target_dry_total_kg": None})
+        assert resp.status_code == 200
+        assert "target_dry_total_kg" not in resp.json()
+        assert "scale_factor" not in resp.json()
+
+    def test_tiny_positive_target_accepted(self):
+        payload = _payload([_agg()])
+        payload["target_dry_total_kg"] = "0.000000001"
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == _expected_sheet(payload)
+
+    def test_scaled_negative_final_water_rejected_without_partial_sheet(self):
+        # 缩放后最终加水量 2 × (50 − 50.6) = −1.2 < 0：整单拒绝，不泄露部分清单
+        payload = _payload(self.SAMPLE_AGGS, design="50")
+        payload["target_dry_total_kg"] = "3200"
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "items" not in body
+        assert "final_water_kg" in body["detail"][0]["field"]
+        assert body["detail"][0]["type"] == "negative_final_water"
