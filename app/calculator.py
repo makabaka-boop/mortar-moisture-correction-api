@@ -77,17 +77,25 @@ def correct_aggregate(
 
 
 def _required_precision(design_water_kg: Decimal, aggregates: Sequence[AggregateLike]) -> int:
-    """按输入有效位数估算精确计算所需的上下文精度。
+    """按输入的量级与小数跨度估算精确计算所需的上下文精度。
 
-    乘积的有效位数不超过乘数位数之和，8 项求和至多再增加 1 位，
-    另加 16 位余量；保证任意高精度输入的中间值都不被上下文截断。
+    精度必须同时覆盖：
+    - 乘积的有效位数（不超过乘数有效位之和）；
+    - 加减法的数位跨度（最大整数位 − 最小小数位）。否则当设计加水量
+      远大于自由水量（如 1e28 − 0.6）时，小数部分会被上下文精度吞掉，
+      最终加水量因舍入而失真。
     """
-    digits = len(design_water_kg.as_tuple().digits)
+    values = [design_water_kg]
     for agg in aggregates:
-        digits += len(agg.dry_mass_kg.as_tuple().digits)
-        digits += len(agg.moisture_pct.as_tuple().digits)
-        digits += len(agg.absorption_pct.as_tuple().digits)
-    return max(28, digits + 16)
+        values.extend([agg.dry_mass_kg, agg.moisture_pct, agg.absorption_pct])
+
+    max_int = max(max(v.adjusted() + 1, 0) for v in values)  # 最大整数位数（量级）
+    max_frac = max(max(-v.as_tuple().exponent, 0) for v in values)  # 最小小数位
+    max_sig = max(len(v.as_tuple().digits) for v in values)  # 最大有效位数
+
+    # 乘积小数位 ≤ 两乘数小数位之和（含 /100 的 2 位），求和至多 +1 位整数；
+    # 取 2 倍跨度加余量，覆盖上述全部组合
+    return max(28, 2 * (max_int + max_frac + max_sig) + 16)
 
 
 def correct_batch(

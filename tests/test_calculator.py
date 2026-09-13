@@ -126,3 +126,20 @@ class TestCorrectBatch:
         )
         assert batch.items[0].wet_mass_kg == Decimal("105.1234567890123")
         assert batch.items[0].free_water_kg == Decimal("5.1234567890122")
+
+    def test_huge_design_water_minus_tiny_free_water(self):
+        # 设计加水量 1e28、自由水 0.6：28 位默认精度会吞掉应扣除的 0.6
+        batch = correct_batch(Decimal("1e28"), [_Agg("砂", "60", "1", "0")])
+        assert batch.final_water_kg == Decimal("9999999999999999999999999999.4")
+
+    def test_huge_design_water_deduction_not_rounded_away(self):
+        # 自由水 0.4：精度不足时会进位回 1e28，最终加水量偏大
+        batch = correct_batch(Decimal("1e28"), [_Agg("砂", "40", "1", "0")])
+        assert batch.final_water_kg == Decimal("9999999999999999999999999999.6")
+
+    def test_huge_design_water_multi_aggregate(self):
+        # 巨大设计加水量 + 8 种骨料：合计自由水仍被精确扣除
+        aggs = [_Agg(f"砂{i}", "100", "1.5", "0.5") for i in range(8)]  # 各 free = 1
+        batch = correct_batch(Decimal("1e30"), aggs)
+        assert batch.total_free_water_kg == Decimal("8")
+        assert batch.final_water_kg == Decimal("999999999999999999999999999992")

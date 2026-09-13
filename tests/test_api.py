@@ -217,6 +217,21 @@ class TestHighPrecisionInputs:
         assert resp.status_code == 200
 
 
+class TestHugeDesignWater:
+    """设计加水量远大于自由水量时，小数扣除不得被精度吞掉。"""
+
+    def test_fraction_deducted_exactly(self):
+        resp = client.post(URL, json=_payload([_agg(dry="60", moisture="1", absorption="0")], design="1e28"))
+        assert resp.status_code == 200
+        assert resp.json()["final_water_kg"] == "9999999999999999999999999999.400"
+
+    def test_deduction_not_rounded_up(self):
+        # 自由水 0.4：精度不足时会进位回 1e28，导致最终加水量偏大
+        resp = client.post(URL, json=_payload([_agg(dry="40", moisture="1", absorption="0")], design="1e28"))
+        assert resp.status_code == 200
+        assert resp.json()["final_water_kg"] == "9999999999999999999999999999.600"
+
+
 class TestHealth:
     def test_health(self):
         resp = client.get("/health")
