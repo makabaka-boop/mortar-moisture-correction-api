@@ -9,6 +9,18 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import sampling_service
+from app.calibration_calculator import SignalOutOfRangeError
+from app.calibration_repository import (
+    CalibrationCurveRepository,
+    CurveNotFoundError,
+)
+from app.calibration_schemas import (
+    CalibrationCurveCreate,
+    CalibrationCurveOut,
+    MoistureConversionIn,
+    MoistureConversionOut,
+)
+from app.calibration_service import convert_signal, create_curve
 from app.calculator import correct_batch
 from app.sampling_repository import (
     BatchAlreadyConfirmedError,
@@ -56,6 +68,7 @@ _MESSAGE_MAP = {
     "string_type": "必须是字符串",
     "list_type": "必须是数组",
     "extra_forbidden": "无法识别的字段",
+    "finite_number": "必须是有限十进制数（不接受 NaN/Infinity）",
 }
 
 
@@ -279,4 +292,87 @@ def confirm_moisture_batch(
             "batch_no",
             f"取样批次已确认，结果不可改动：{batch_no}",
             "batch_already_confirmed",
+        )
+
+
+# --------------------------------------------------------------------------
+# 校准曲线（换探头后标准样对照固化为不可变曲线 → 生产侧按曲线换算原始信号）
+# --------------------------------------------------------------------------
+
+# 校准曲线与取样批次共用同一 SQLite 文件：CALIBRATION_DB_PATH 可独立覆盖；
+# 未设置时回退 SAMPLING_DB_PATH（compose 中二者都挂到共享卷的同一文件），
+# 再未设置则使用默认路径。
+DEFAULT_CALIBRATION_DB_PATH = "data/moisture_batches.db"
+
+_calibration_repo: CalibrationCurveRepository | None = None
+
+
+def get_calibration_repository() -> CalibrationCurveRepository:
+    """进程级单例 SQLite 仓储；CALIBRATION_DB_PATH/SAMPLING_DB_PATH 可覆盖库文件位置。
+
+    测试以 FastAPI 的 dependency_overrides 替换为临时库仓储。
+    """
+    global _calibration_repo
+    if _calibration_repo is None:
+        db_path = os.environ.get(
+            "CALIBRATION_DB_PATH",
+            os.environ.get("SAMPLING_DB_PATH", DEFAULT_CALIBRATION_DB_PATH),
+        )
+        _calibration_repo = CalibrationCurveRepository(db_path)
+    return _calibration_repo
+
+
+@app.post(
+    "/api/v1/moisture-calibration-curves",
+    response_model=CalibrationCurveOut,
+    status_code=201,
+    summary="创建校准曲线（换探头后的标准样对照，不可变）",
+)
+def create_calibration_curve(
+    payload: CalibrationCurveCreate,
+    repo: CalibrationCurveRepository = Depends(get_calibration_repository),
+) -> CalibrationCurveOut:
+    """接收传感器编号与 3 ~ 8 个严格递增的原始信号/参考含水率点。
+
+    生成曲线编号后作为不可变记录整批写入既有 SQLite 文件；非法点集
+    （点数越界、重复/倒序信号点、参考含水率越 0 ~ 40、两序列长度不一致、
+    未知字段）由 Pydantic 在入口以 422 拒绝，失败时不产生或改写任何记录。
+    """
+    return create_curve(repo, payload)
+
+
+@app.post(
+    "/api/v1/moisture-calibration-curves/convert",
+    response_model=MoistureConversionOut,
+    summary="按校准曲线把单个原始信号换算为含水率",
+)
+def convert_moisture_signal(
+    payload: MoistureConversionIn,
+    repo: CalibrationCurveRepository = Depends(get_calibration_repository),
+) -> MoistureConversionOut | JSONResponse:
+    """以相邻两点做 Decimal 线性插值，中间值不舍入，含水率三位 HALF_UP。
+
+    命中端点时直接返回该点参考值（区间回显以该端点为端的相邻区间）；
+    曲线不存在返回结构化 404，信号落在曲线范围外返回定位到 raw_signal
+    的 422，两种失败均不写库、不做外推。
+    """
+    try:
+        return convert_signal(repo, payload)
+    except CurveNotFoundError:
+        return _error(
+            404,
+            "curve_no",
+            f"校准曲线不存在：{payload.curve_no}",
+            "curve_not_found",
+        )
+    except SignalOutOfRangeError as exc:
+        low, high, signal = exc.args[0]
+        return _error(
+            422,
+            "raw_signal",
+            (
+                f"原始信号 {signal} 落在曲线范围 [{low}, {high}] 之外，"
+                "不做外推"
+            ),
+            "raw_signal_out_of_range",
         )

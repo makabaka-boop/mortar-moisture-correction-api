@@ -11,5 +11,11 @@
 - app.sampling_repository  SQLite 仓储（整批事务、条件确认、重建可读）
 - app.sampling_service     创建/确认编排与响应组装
 
+模块划分（校准曲线）：
+- app.calibration_schemas     校准曲线契约（3~8 个严格递增对照点，参考含水率 0~40）
+- app.calibration_calculator  相邻两点 Decimal 线性插值（完整精度）、端点直返、越界拒绝
+- app.calibration_repository  SQLite 仓储（不可变曲线/对照点、触发器、追加到既有库）
+- app.calibration_service     创建曲线/换算编排与响应组装
+
 - app.main       FastAPI 装配与错误反馈
 """

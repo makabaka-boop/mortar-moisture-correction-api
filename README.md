@@ -7,6 +7,10 @@
 而不是先在表外算出百分率再录入修正单。批次创建为“待确认”，确认时才计算各组含水率与
 中位数代表值并转为“已确认”，以标准库 **SQLite** 文件持久化（无独立数据库服务）。
 
+**校准曲线模块**：在线含水传感器更换探头后，实验员把标准样对照数据固化为独立、不可变的
+校准曲线（而不是在设备侧保存零散系数）；生产调用方只给曲线编号与单个原始信号，由服务按
+相邻两点做 Decimal 线性插值换算含水率。曲线与取样批次保存在同一个 SQLite 文件中。
+
 纯后端 API；Python 3.12 + FastAPI + Pydantic + Decimal（SQLite 用标准库 sqlite3）。
 
 ## 计算契约（固定公式）
@@ -258,6 +262,87 @@
 仓储初始化会自动迁移旧版库：给既有批次补 `revision_no = 0`，并建立修订审计表。
 仓储可以随时销毁并按同一文件重建，待确认/已确认批次与结果都能重新读出。
 
+## 校准曲线（换探头后的标准样对照固化）
+
+在线含水传感器更换探头后，实验员把 3 ~ 8 个标准样“原始信号 → 参考含水率”对照点
+一次性固化为独立曲线；生产侧只持曲线编号，换算时由服务查曲线，**不在设备侧保存
+零散系数**。曲线一经创建即为**不可变记录**：服务没有任何更新/删除入口，库内
+触发器同时拒绝绕过仓储直接 `UPDATE`/`DELETE`。
+
+```
+含水率（中间点）= y1 + (x − x1) × (y2 − y1) ÷ (x2 − x1)   （相邻两点线性插值）
+```
+
+- `raw_signals`：有限十进制数，**3 ~ 8 个且严格递增**（重复点或倒序以 422 拒绝，
+  定位到 `raw_signals`）；信号单位由传感器约定，小数位数不限，不另设数值范围；
+- `reference_moisture_pct`：参考含水率质量百分数，**0 ~ 40（端点包含）**，点数必须
+  与原始信号一致且严格递增，错误定位到 `reference_moisture_pct`；
+- 无法识别的字段一律 422 拒绝（`extra="forbid"`）；非法点集**不落任何数据**；
+- 换算以相邻两点做 **Decimal** 线性插值，**中间值不舍入**，含水率仅在出口按
+  **ROUND_HALF_UP 保留三位**；端点输入直接返回该点参考值，并回显命中区间
+  （首端点取首段、末端点取末段、内部端点取其右侧相邻区间）的四个端点值；
+- 计算上下文精度随输入的量级、小数跨度与有效位数自适应（下限 50 位），紧挨三位
+  舍入边界的高精度对照点不会被固定精度截断误进位；
+- 曲线不存在 → 结构化 **404**（`type: curve_not_found`）；信号落在曲线范围外 →
+  定位到 `raw_signal` 的 **422**（`type: raw_signal_out_of_range`，不做外推）；
+- 曲线主行与全部对照点在**同一事务**内写入，失败整体回滚；两表以
+  `CREATE TABLE IF NOT EXISTS` 追加到既有 SQLite 文件，取样批次等既有表不受影响。
+
+### `POST /api/v1/moisture-calibration-curves`
+
+创建曲线，返回 `201` 与曲线编号（`CC` + 日期 + 随机段，形如 `CC20260914-7F3A9C21`）：
+
+```json
+{
+  "sensor_id": "MOIST-SENSOR-A1",
+  "raw_signals": ["4.0", "8.0", "12.0", "16.0", "20.0"],
+  "reference_moisture_pct": ["0", "5", "10", "20", "40"]
+}
+```
+
+响应（原始读数原样回显，带创建时间）：
+
+```json
+{
+  "curve_no": "CC20260914-FE298FEE",
+  "sensor_id": "MOIST-SENSOR-A1",
+  "points": [
+    {"index": 0, "raw_signal": "4.0", "reference_moisture_pct": "0"},
+    {"index": 1, "raw_signal": "8.0", "reference_moisture_pct": "5"},
+    {"index": 2, "raw_signal": "12.0", "reference_moisture_pct": "10"},
+    {"index": 3, "raw_signal": "16.0", "reference_moisture_pct": "20"},
+    {"index": 4, "raw_signal": "20.0", "reference_moisture_pct": "40"}
+  ],
+  "created_at": "2026-09-14T16:10:00.123456+00:00"
+}
+```
+
+### `POST /api/v1/moisture-calibration-curves/convert`
+
+按曲线把单个原始信号换算为含水率，返回命中区间端点与三位 HALF_UP 含水率：
+
+```json
+{"curve_no": "CC20260914-FE298FEE", "raw_signal": "15.1234"}
+```
+
+```json
+{
+  "curve_no": "CC20260914-FE298FEE",
+  "raw_signal": "15.1234",
+  "interval": {
+    "lower_signal": "12.0",
+    "upper_signal": "16.0",
+    "lower_moisture_pct": "10",
+    "upper_moisture_pct": "20"
+  },
+  "moisture_pct": "17.809"
+}
+```
+
+端点输入（如 `"8.0"`）直接返回该点参考值 `"5.000"`，不做插值除法；`NaN`/`Infinity`
+等非有限信号以 422 拒绝。曲线与取样批次共用同一 SQLite 文件，路径可用
+`CALIBRATION_DB_PATH` 独立覆盖，未设置时回退 `SAMPLING_DB_PATH`。
+
 ## 错误反馈（422）
 
 所有错误统一为 `{"detail": [...]}`，每条错误的 `field` **定位到骨料下标**：
@@ -283,9 +368,13 @@ app/
 ├── sampling_calculator.py  # 取样计算：（湿样−干样）/干样×100 各组结果与中位数（完整精度）
 ├── sampling_repository.py  # SQLite 仓储：整批事务、乐观锁修订/审计、条件确认、旧库迁移、重建可读
 ├── sampling_service.py     # 取样编排：创建/修订单组读数（待确认）/确认（计算并置已确认）/响应组装
-└── main.py                 # FastAPI 装配：修正单端点 + 取样批次创建/修订/确认端点与统一错误反馈
-tests/                      # pytest：修正单既有覆盖 + 取样模块计算/仓储/API 覆盖
-verify.py                   # 一次性验收：修正单样例 + 取样批次创建/修订/并发冲突/非法回滚/确认/迁移重建
+├── calibration_calculator.py  # 校准曲线计算：相邻两点 Decimal 线性插值（中间值不舍入）、端点直返、越界拒绝
+├── calibration_schemas.py     # 校准曲线契约：3~8 个严格递增对照点、参考含水率 0~40、extra=forbid
+├── calibration_repository.py  # SQLite 仓储：曲线/对照点整批事务、不可变触发器、追加到既有库
+├── calibration_service.py     # 校准编排：创建不可变曲线/换算（插值 + 三位 HALF_UP）/响应组装
+└── main.py                 # FastAPI 装配：修正单端点 + 取样批次端点 + 校准曲线创建/换算端点与统一错误反馈
+tests/                      # pytest：修正单既有覆盖 + 取样模块 + 校准曲线计算/仓储/API 覆盖
+verify.py                   # 一次性验收：修正单 + 取样批次全流程 + 校准曲线创建/插值端点/非法不落库/404/422/不可变
 ```
 
 ## 本地运行
@@ -298,6 +387,8 @@ python verify.py                         # 对 localhost:8000 做一次性验收
 # 或指定地址：API_BASE_URL=http://localhost:8123 python verify.py
 # SQLite 库文件位置（默认 data/moisture_batches.db）：
 SAMPLING_DB_PATH=/tmp/moisture_batches.db uvicorn app.main:app --port 8000
+# 校准曲线默认与取样批次同库；如需独立文件可单独覆盖（未设置时回退 SAMPLING_DB_PATH）：
+CALIBRATION_DB_PATH=/tmp/calibration.db uvicorn app.main:app --port 8000
 ```
 
 交互式文档：`http://localhost:8000/docs`。
@@ -316,5 +407,7 @@ docker compose run --rm verify           # 等价的一次性运行方式
 
 `verify` 服务等待 `api` 健康后：提交两份修正单样例独立复算比对；再创建 4 组称量的
 取样批次、拒绝一宗非法称量（422 定位 readings 下标）、确认并按完整精度与三位
-HALF_UP 中位数独立复算比对、重复确认核对 409、不存在编号核对 404，最后在共享卷的
-同一 SQLite 文件上**重建仓储**读取同一批次，全部通过退出码 0，否则退出码 1。
+HALF_UP 中位数独立复算比对、重复确认核对 409、不存在编号核对 404，在共享卷的
+同一 SQLite 文件上**重建仓储**读取同一批次；最后创建 5 点校准曲线，按 Fraction
+独立复算逐位比对插值与精确端点，核对非法点集不落库、未知曲线 404、越界信号 422、
+触发器拒绝直接改写曲线，全部通过退出码 0，否则退出码 1。

@@ -15,6 +15,15 @@
    f. 重复确认/已确认后修订：409 且结果与首次完全一致（已确认数据不可改动）；
    g. 旧版 SQLite 库初始化迁移：既有批次 revision_no 补 0 且仍可确认；
    h. 重建仓储：直接打开同一个 SQLite 文件新建仓储实例，仍能读到同一批次。
+4. 校准曲线（换探头后的标准样对照固化）——
+   a. 创建：传感器编号 + 3~8 个严格递增原始信号/参考含水率点，201 回显编号；
+   b. 换算：相邻两点 Decimal 线性插值，含水率按 ROUND_HALF_UP 三位，命中区间
+      端点逐位回显；端点输入直接返回该点参考值；独立 Fraction 复算逐位比对；
+   c. 非法点集（重复信号点、参考含水率越 0~40、点数不匹配、未知字段）：422
+      且库内曲线数不增加（失败时不产生或改写记录）；
+   d. 未知曲线：结构化 404；信号越界：定位到 raw_signal 的 422，不做外推；
+   e. 不可变：绕过仓储直接 UPDATE/DELETE 同一 SQLite 文件被触发器拒绝；
+   f. 与取样批次共库迁移：同一文件上两模块表并存，重建仓储仍读到同一曲线。
 
 用法：
     python verify.py                 # 默认打 http://localhost:8000
@@ -38,6 +47,8 @@ import httpx
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 SHEET_URL = f"{API_BASE_URL}/api/v1/correction-sheet"
 BATCH_URL = f"{API_BASE_URL}/api/v1/moisture-batches"
+CURVE_URL = f"{API_BASE_URL}/api/v1/moisture-calibration-curves"
+CONVERT_URL = f"{CURVE_URL}/convert"
 # 与 API 容器同一个 SQLite 库文件（compose 共享卷），用于“重建仓储”验收
 SAMPLING_DB_PATH = os.environ.get("SAMPLING_DB_PATH", "data/moisture_batches.db")
 TIMEOUT = 10.0
@@ -74,6 +85,22 @@ REVISED_SAMPLING_READINGS = [
     reading if i != REVISED_INDEX else REVISED_READING
     for i, reading in enumerate(SAMPLING_READINGS)
 ]
+
+# 校准曲线验收样例：5 个对照点（3~8 界内），覆盖内部端点与多段插值
+CALIBRATION_POINTS = [
+    {"raw_signal": "4.0", "reference_moisture_pct": "0"},
+    {"raw_signal": "8.0", "reference_moisture_pct": "5"},
+    {"raw_signal": "12.0", "reference_moisture_pct": "10"},
+    {"raw_signal": "16.0", "reference_moisture_pct": "20"},
+    {"raw_signal": "20.0", "reference_moisture_pct": "40"},
+]
+CALIBRATION_PAYLOAD = {
+    "sensor_id": "MOIST-SENSOR-A1",
+    "raw_signals": [p["raw_signal"] for p in CALIBRATION_POINTS],
+    "reference_moisture_pct": [p["reference_moisture_pct"] for p in CALIBRATION_POINTS],
+}
+# 换算抽验：端点 + 中间点（含需多位小数的非终止值）
+CONVERSION_CHECKS = ["4.0", "8.0", "12.0", "16.0", "20.0", "6.0", "10.0", "15.1234"]
 
 LEGACY_DB_PATH = os.environ.get(
     "LEGACY_SAMPLING_DB_PATH",
@@ -181,6 +208,36 @@ def expected_sampling(readings: list[dict]) -> dict:
     return {
         "reading_pcts": [format(p, "f") for p in pcts],
         "median3": median3,
+    }
+
+
+def expected_conversion(points: list[dict], raw_signal: str) -> dict:
+    """独立复算线性插值：Fraction 严格有理数插值 + 三位 HALF_UP，不复用产品代码。
+
+    区间定位与产品同约定：首端点取首段、末端点取末段、内部端点取其右侧
+    相邻区间；端点输入直接取参考值，不做插值。
+    """
+    xs = [Fraction(p["raw_signal"]) for p in points]
+    ys = [Fraction(p["reference_moisture_pct"]) for p in points]
+    x = Fraction(raw_signal)
+    if x == xs[0]:
+        i, j, y = 0, 1, ys[0]
+    elif x == xs[-1]:
+        i, j, y = len(xs) - 2, len(xs) - 1, ys[-1]
+    elif x in xs:
+        k = xs.index(x)
+        i, j, y = k, k + 1, ys[k]
+    else:
+        i = next(k for k in range(len(xs) - 1) if xs[k] < x < xs[k + 1])
+        j = i + 1
+        y = ys[i] + (x - xs[i]) * (ys[j] - ys[i]) / (xs[j] - xs[i])
+    thousandths = int(y * 1000 + Fraction(1, 2))  # HALF_UP（含水率恒非负）
+    return {
+        "moisture_pct": f"{Decimal(thousandths) / Decimal(1000):.3f}",
+        "lower_signal": points[i]["raw_signal"],
+        "upper_signal": points[j]["raw_signal"],
+        "lower_moisture_pct": points[i]["reference_moisture_pct"],
+        "upper_moisture_pct": points[j]["reference_moisture_pct"],
     }
 
 
@@ -333,7 +390,19 @@ def verify_sampling_batch() -> bool:
         return False
     print(f"[verify] 已修订读数[{REVISED_INDEX}]，revision_no 0 → 1，其他读数保持不变")
 
-    # 4) 两个客户端都带旧修订号 0 并发写：BEGIN IMMEDIATE 下仅一笔成功，另一笔 409
+    # 4) 两个客户端都带旧修订号 0 并发写**专用批次**（主批次已在第 3 步顺序修订到
+    #    revision_no=1，直接在它上面并发旧号会两笔都过期）：BEGIN IMMEDIATE 下
+    #    仅一笔成功（0 → 1），另一笔 409；主批次的修订历史不受影响
+    concurrent_create = httpx.post(
+        BATCH_URL,
+        json={"pile_name": "并发专用堆", "readings": SAMPLING_READINGS},
+        timeout=TIMEOUT,
+    )
+    if concurrent_create.status_code != 201:
+        print(f"[verify] FAIL: 创建并发专用批次 HTTP {concurrent_create.status_code}: "
+              f"{concurrent_create.text}", file=sys.stderr)
+        return False
+    concurrent_batch_no = concurrent_create.json()["batch_no"]
     concurrent_payloads = [
         {"wet_sample_mass": "501.00", "dry_sample_mass": "458.50", "revision_no": 0},
         {"wet_sample_mass": "502.00", "dry_sample_mass": "458.50", "revision_no": 0},
@@ -342,7 +411,7 @@ def verify_sampling_batch() -> bool:
         concurrent_responses = list(
             executor.map(
                 lambda payload: httpx.patch(
-                    revision_url(batch_no, REVISED_INDEX), json=payload, timeout=TIMEOUT
+                    revision_url(concurrent_batch_no, REVISED_INDEX), json=payload, timeout=TIMEOUT
                 ),
                 concurrent_payloads,
             )
@@ -356,15 +425,16 @@ def verify_sampling_batch() -> bool:
     if conflict["detail"][0]["type"] != "revision_conflict":
         print(f"[verify] FAIL: 并发冲突类型错误：{conflict}", file=sys.stderr)
         return False
-    current_revision = 2
+    current_revision = 1
     winner = next(resp for resp in concurrent_responses if resp.status_code == 200).json()
     if winner["revision_no"] != current_revision:
-        print(f"[verify] FAIL: 并发成功后修订号应为 2，实际 {winner['revision_no']}",
+        print(f"[verify] FAIL: 并发成功后专用批次修订号应为 1，实际 {winner['revision_no']}",
               file=sys.stderr)
         return False
-    print("[verify] 旧修订号并发写入：一笔成功（revision_no → 2），过期请求返回 409")
+    print("[verify] 旧修订号并发写入：一笔成功（专用批次 revision_no → 1），过期请求返回 409")
 
-    # 5) 非法修订称量 422：读数、修订号、审计记录均保持不变
+    # 5) 非法修订称量 422：读数、修订号、审计记录均保持不变（主批次仍为第 3 步后的
+    #    revision_no=1、1 条审计；并发演练发生在专用批次上）
     illegal_revision = {"wet_sample_mass": "100", "dry_sample_mass": "100", "revision_no": current_revision}
     illegal_rev_resp = httpx.patch(
         revision_url(batch_no, 0), json=illegal_revision, timeout=TIMEOUT
@@ -377,7 +447,7 @@ def verify_sampling_batch() -> bool:
         print(f"[verify] FAIL: 非法修订应定位 dry_sample_mass：{illegal_rev_resp.text}",
               file=sys.stderr)
         return False
-    # 直接打开同一 SQLite 文件核对：422 发生后修订号仍为 2、读数未变、审计仍为前两条
+    # 直接打开同一 SQLite 文件核对：422 发生后主批次修订号仍为 1、读数未变、审计仍为 1 条
     from app.sampling_repository import SamplingBatchRepository
 
     check_repo = SamplingBatchRepository(SAMPLING_DB_PATH)
@@ -386,7 +456,7 @@ def verify_sampling_batch() -> bool:
     if record_after_illegal.revision_no != current_revision:
         print("[verify] FAIL: 非法修订改变了 revision_no", file=sys.stderr)
         return False
-    if len(audits_after_illegal) != 2:
+    if len(audits_after_illegal) != 1:
         print(f"[verify] FAIL: 非法修订不应写审计，实际 {len(audits_after_illegal)} 条",
               file=sys.stderr)
         return False
@@ -531,15 +601,19 @@ def verify_sampling_batch() -> bool:
         print("[verify] FAIL: 重建仓储后边界批次代表值不一致", file=sys.stderr)
         return False
     audits = rebuilt.list_reading_revisions(batch_no)
-    if len(audits) != 2:
-        print(f"[verify] FAIL: 主批次应仅保留两次成功修订审计，实际 {len(audits)} 条",
+    if len(audits) != 1:
+        print(f"[verify] FAIL: 主批次应仅保留第 3 步一次成功修订审计，实际 {len(audits)} 条",
               file=sys.stderr)
         return False
     if audits[0].previous_revision_no != 0 or audits[0].new_revision_no != 1:
-        print("[verify] FAIL: 第一条审计的修改前后修订号不是 0 → 1", file=sys.stderr)
+        print("[verify] FAIL: 主批次唯一审计的修改前后修订号不是 0 → 1", file=sys.stderr)
         return False
-    if audits[1].previous_revision_no != 1 or audits[1].new_revision_no != 2:
-        print("[verify] FAIL: 第二条审计的修改前后修订号不是 1 → 2", file=sys.stderr)
+    # 并发专用批次独立保留一次 0 → 1 的成功修订
+    concurrent_audits = rebuilt.list_reading_revisions(concurrent_batch_no)
+    if (len(concurrent_audits) != 1
+            or concurrent_audits[0].previous_revision_no != 0
+            or concurrent_audits[0].new_revision_no != 1):
+        print("[verify] FAIL: 并发专用批次应保留一次 0 → 1 审计", file=sys.stderr)
         return False
     print(f"[verify] 重建仓储后仍读到同一批次 {batch_no}（已确认，结果逐位一致，审计完整）")
 
@@ -564,6 +638,173 @@ def verify_sampling_batch() -> bool:
     return True
 
 
+def verify_calibration_curve() -> bool:
+    """校准曲线闭环验收：创建 → 插值/端点 → 非法点集不落库 → 404/422 → 不可变 → 共库重建。"""
+    # 创建前记录库内曲线数（与取样批次共库），用于核对非法点集不落库
+    from app.calibration_repository import CalibrationCurveRepository
+
+    check_repo = CalibrationCurveRepository(SAMPLING_DB_PATH)
+    curves_before = check_repo.count_curves()
+
+    # 1) 创建：201，回显曲线编号、传感器编号与原始对照点
+    create_resp = httpx.post(CURVE_URL, json=CALIBRATION_PAYLOAD, timeout=TIMEOUT)
+    if create_resp.status_code != 201:
+        print(f"[verify] FAIL: 创建校准曲线 HTTP {create_resp.status_code}: "
+              f"{create_resp.text}", file=sys.stderr)
+        return False
+    created = create_resp.json()
+    curve_no = created["curve_no"]
+    if not curve_no.startswith("CC") or len(curve_no) != 19:
+        print(f"[verify] FAIL: 曲线编号格式错误：{curve_no}", file=sys.stderr)
+        return False
+    if created["sensor_id"] != CALIBRATION_PAYLOAD["sensor_id"] or not created["created_at"]:
+        print(f"[verify] FAIL: 创建回显不符：{created}", file=sys.stderr)
+        return False
+    if [(p["raw_signal"], p["reference_moisture_pct"]) for p in created["points"]] == [
+        ("4", "0"), ("8", "5"), ("12", "10"), ("16", "20"), ("20", "40")
+    ]:
+        print("[verify] FAIL: 对照点必须按原始读数字符串原样回显（不应规范化）", file=sys.stderr)
+        return False
+    if [(p["raw_signal"], p["reference_moisture_pct"]) for p in created["points"]] != [
+        (p["raw_signal"], p["reference_moisture_pct"]) for p in CALIBRATION_POINTS
+    ]:
+        print(f"[verify] FAIL: 对照点回显与提交不一致：{created['points']}", file=sys.stderr)
+        return False
+    print(f"[verify] 创建校准曲线 {curve_no}（{len(created['points'])} 个对照点，不可变）")
+
+    # 2) 换算：端点直接返回参考值；中间点 Fraction 独立复算逐位比对，区间端点回显
+    for raw_signal in CONVERSION_CHECKS:
+        resp = httpx.post(
+            CONVERT_URL, json={"curve_no": curve_no, "raw_signal": raw_signal}, timeout=TIMEOUT
+        )
+        if resp.status_code != 200:
+            print(f"[verify] FAIL: 换算 {raw_signal} HTTP {resp.status_code}: {resp.text}",
+                  file=sys.stderr)
+            return False
+        body = resp.json()
+        expected = expected_conversion(CALIBRATION_POINTS, raw_signal)
+        if body["moisture_pct"] != expected["moisture_pct"]:
+            print(f"[verify] FAIL: 信号 {raw_signal} 含水率不符：期望 "
+                  f"{expected['moisture_pct']}，实际 {body['moisture_pct']}", file=sys.stderr)
+            return False
+        interval = body["interval"]
+        if (interval["lower_signal"], interval["upper_signal"],
+                interval["lower_moisture_pct"], interval["upper_moisture_pct"]) != (
+            expected["lower_signal"], expected["upper_signal"],
+            expected["lower_moisture_pct"], expected["upper_moisture_pct"],
+        ):
+            print(f"[verify] FAIL: 信号 {raw_signal} 命中区间端点不符：{interval}",
+                  file=sys.stderr)
+            return False
+        if body["raw_signal"] != raw_signal or body["curve_no"] != curve_no:
+            print(f"[verify] FAIL: 换算响应回显字段不符：{body}", file=sys.stderr)
+            return False
+    print("[verify] 换算验收通过：端点直接返回参考值，中间点 Decimal 线性插值"
+          "（ROUND_HALF_UP 三位）与独立 Fraction 复算逐位一致")
+    print(f"  例：信号 6.0 → {expected_conversion(CALIBRATION_POINTS, '6.0')['moisture_pct']}%，"
+          f"信号 15.1234 → {expected_conversion(CALIBRATION_POINTS, '15.1234')['moisture_pct']}%")
+
+    # 3) 非法点集：422 且库内曲线数不增加（失败时不产生或改写记录）
+    illegal_cases = [
+        (
+            "重复信号点",
+            {**CALIBRATION_PAYLOAD,
+             "raw_signals": ["4.0", "8.0", "8.0", "16.0", "20.0"]},
+            "raw_signals", "raw_signals_not_strictly_increasing",
+        ),
+        (
+            "参考含水率越界",
+            {**CALIBRATION_PAYLOAD,
+             "reference_moisture_pct": ["0", "5", "10", "20", "40.0001"]},
+            "reference_moisture_pct", "reference_moisture_out_of_range",
+        ),
+        (
+            "点数不匹配",
+            {"sensor_id": "X", "raw_signals": ["4.0", "8.0", "12.0", "16.0"],
+             "reference_moisture_pct": ["0", "5", "10"]},
+            "reference_moisture_pct", "point_count_mismatch",
+        ),
+        (
+            "未知字段",
+            {**CALIBRATION_PAYLOAD, "coefficients": [0.1, 0.2]},
+            "coefficients", "extra_forbidden",
+        ),
+    ]
+    for label, payload, field, err_type in illegal_cases:
+        resp = httpx.post(CURVE_URL, json=payload, timeout=TIMEOUT)
+        if resp.status_code != 422:
+            print(f"[verify] FAIL: {label}应返回 422，实际 {resp.status_code}", file=sys.stderr)
+            return False
+        detail = resp.json()["detail"][0]
+        if detail["field"] != field or detail["type"] != err_type:
+            print(f"[verify] FAIL: {label}错误定位/类型不符：{detail}", file=sys.stderr)
+            return False
+    if check_repo.count_curves() != curves_before + 1:
+        print("[verify] FAIL: 非法点集后曲线数发生变化（应仅成功创建一条）", file=sys.stderr)
+        return False
+    print("[verify] 非法点集（重复信号/含水率越界/点数不匹配/未知字段）均 422，未产生任何曲线")
+
+    # 4) 未知曲线 → 结构化 404；信号越界 → 定位 raw_signal 的 422，不做外推
+    missing = httpx.post(
+        CONVERT_URL, json={"curve_no": "CC19990101-00000000", "raw_signal": "10"}, timeout=TIMEOUT
+    )
+    if missing.status_code != 404 or missing.json()["detail"][0]["type"] != "curve_not_found":
+        print(f"[verify] FAIL: 未知曲线应返回结构化 404：{missing.status_code} {missing.text}",
+              file=sys.stderr)
+        return False
+    for bad_signal in ("3.9999", "20.0001"):
+        resp = httpx.post(
+            CONVERT_URL, json={"curve_no": curve_no, "raw_signal": bad_signal}, timeout=TIMEOUT
+        )
+        if resp.status_code != 422:
+            print(f"[verify] FAIL: 越界信号 {bad_signal} 应返回 422，实际 {resp.status_code}",
+                  file=sys.stderr)
+            return False
+        detail = resp.json()["detail"][0]
+        if detail["field"] != "raw_signal" or detail["type"] != "raw_signal_out_of_range":
+            print(f"[verify] FAIL: 越界错误定位应为 raw_signal：{detail}", file=sys.stderr)
+            return False
+        if bad_signal not in detail["message"]:
+            print(f"[verify] FAIL: 越界错误信息应带原始信号 {bad_signal}：{detail['message']}",
+                  file=sys.stderr)
+            return False
+    print("[verify] 未知曲线返回结构化 404；信号越界返回定位到 raw_signal 的 422（不做外推）")
+
+    # 5) 不可变：绕过仓储直接 UPDATE/DELETE 同一 SQLite 文件被触发器拒绝
+    import sqlite3 as _sqlite3
+
+    with _sqlite3.connect(SAMPLING_DB_PATH) as raw:
+        for sql in (
+            f"UPDATE calibration_curves SET sensor_id='HACK' WHERE curve_no='{curve_no}'",
+            f"DELETE FROM calibration_curves WHERE curve_no='{curve_no}'",
+            "UPDATE calibration_points SET raw_signal='1'",
+            "DELETE FROM calibration_points",
+        ):
+            try:
+                raw.execute(sql)
+                raw.commit()
+                print(f"[verify] FAIL: 不可变触发器未拦截：{sql}", file=sys.stderr)
+                return False
+            except _sqlite3.IntegrityError:
+                raw.rollback()
+    unchanged = check_repo.get(curve_no)
+    if unchanged.sensor_id != CALIBRATION_PAYLOAD["sensor_id"]:
+        print("[verify] FAIL: 触发器拒绝后曲线被改动", file=sys.stderr)
+        return False
+    print("[verify] 曲线不可变：直接改写/删除 SQLite 记录被触发器拒绝，仓储也无更新/删除入口")
+
+    # 6) 共库重建：与取样批次同文件，新建仓储实例仍读到同一曲线（迁移幂等）
+    rebuilt = CalibrationCurveRepository(SAMPLING_DB_PATH)
+    record = rebuilt.get(curve_no)
+    if [(p.raw_signal, p.reference_moisture_pct) for p in record.points] != [
+        (p["raw_signal"], p["reference_moisture_pct"]) for p in CALIBRATION_POINTS
+    ]:
+        print("[verify] FAIL: 重建仓储后对照点不一致", file=sys.stderr)
+        return False
+    print(f"[verify] 重建仓储后仍读到同一曲线 {curve_no}（与取样批次共库，迁移幂等）")
+    return True
+
+
 def main() -> int:
     wait_for_api()
 
@@ -582,7 +823,9 @@ def main() -> int:
 
     if not verify_sampling_batch():
         return 1
-    print("[verify] 全部验收通过（修正单 ×2 + 取样创建/修订/并发/回滚/确认/409/404/旧库迁移/重建仓储）")
+    if not verify_calibration_curve():
+        return 1
+    print("[verify] 全部验收通过（修正单 ×2 + 取样批次全流程 + 校准曲线闭环/不可变/共库重建）")
     return 0
 
 

@@ -273,7 +273,7 @@ class TestReviseReading:
         assert detail["field"] == "batch_no"
         assert detail["type"] == "batch_not_found"
 
-    @pytest.mark.parametrize("bad_index", [-1, 2, 99])
+    @pytest.mark.parametrize("bad_index", [-1, 3, 99])
     def test_out_of_bounds_index_returns_422_and_changes_nothing(
         self, sampling_repo, bad_index
     ):

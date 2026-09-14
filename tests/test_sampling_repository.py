@@ -246,19 +246,37 @@ class TestReviseReading:
         with pytest.raises(BatchNotFoundError):
             repo.revise_reading("MC19990101-DEADBEEF", 0, "501", "478", 0)
 
-    def test_audit_insert_failure_rolls_back_reading_and_revision(self, repo, created, monkeypatch):
-        real_execute = sqlite3.Connection.execute
+    def test_audit_insert_failure_rolls_back_reading_and_revision(self, repo, created):
+        class _FailingConnection:
+            """仅拦截审计表 INSERT 的连接代理，其余方法委托真实 sqlite 连接。"""
 
-        def failing_audit_execute(conn, sql, params=()):
-            if "INSERT INTO sampling_reading_revisions" in sql:
-                raise RuntimeError("模拟审计写入失败")
-            return real_execute(conn, sql, params)
+            def __init__(self, real):
+                self._real = real
 
-        monkeypatch.setattr(sqlite3.Connection, "execute", failing_audit_execute)
+            def execute(self, sql, params=()):
+                if "INSERT INTO sampling_reading_revisions" in sql:
+                    raise RuntimeError("模拟审计写入失败")
+                return self._real.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._real.__exit__(*exc)
+
+        class AuditFailRepository(SamplingBatchRepository):
+            def _connect(self):
+                return _FailingConnection(super()._connect())
+
+        # sqlite3.Connection 是不可变 C 类型，不能 monkeypatch 其 execute；
+        # 改为以同一库文件构造子类仓储，在连接层注入审计写入失败
+        failing_repo = AuditFailRepository(repo._db_path)
         with pytest.raises(RuntimeError):
-            repo.revise_reading(created.batch_no, 0, "501", "478", 0)
+            failing_repo.revise_reading(created.batch_no, 0, "501", "478", 0)
 
-        monkeypatch.undo()
         stored = repo.get(created.batch_no)
         assert stored.revision_no == 0
         assert (
