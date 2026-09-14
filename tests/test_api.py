@@ -373,11 +373,60 @@ class TestTargetDryTotal:
         assert resp.status_code == 422
         assert resp.json()["detail"][0]["field"] == "target_dry_total_kg"
 
-    def test_null_target_treated_as_omitted(self):
-        resp = client.post(URL, json=_payload([_agg()], ) | {"target_dry_total_kg": None})
+    def test_explicit_null_target_rejected(self):
+        # 显式提交空的目标干料总量：定位目标字段并拒绝，而非按未传参数生成原批次修正单
+        resp = client.post(URL, json=_payload([_agg()]) | {"target_dry_total_kg": None})
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "target_dry_total_kg"
+
+    def test_omitted_target_still_treated_as_unscaled(self):
+        # 只有省略该字段才按不缩放处理（显式 null 与之区分，见上一条测试）
+        resp = client.post(URL, json=_payload([_agg()]))
         assert resp.status_code == 200
         assert "target_dry_total_kg" not in resp.json()
         assert "scale_factor" not in resp.json()
+
+    def test_misspelled_target_field_rejected(self):
+        # 误写目标字段名：拒绝无法识别的输入字段，而非静默忽略后返回未缩放批次
+        resp = client.post(URL, json=_payload([_agg()]) | {"target_dry_total_kgg": "200"})
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "target_dry_total_kgg"
+        assert resp.json()["detail"][0]["type"] == "extra_forbidden"
+
+    def test_unknown_extra_field_rejected(self):
+        resp = client.post(URL, json=_payload([_agg()]) | {"batch_no": "A-1"})
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "batch_no"
+
+    @pytest.mark.parametrize(
+        "target",
+        ["1e999999999999999999", "1e1000", "1e29", "1e-29", "1e-999999999999999999"],
+    )
+    def test_out_of_computable_range_target_rejected(self, target):
+        # 可解析但超出计算范围的目标：定位目标字段并明确拒绝，不得返回 500
+        payload = _payload([_agg()])
+        payload["target_dry_total_kg"] = target
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "target_dry_total_kg"
+
+    @pytest.mark.parametrize("target", ["1e28", "1e-28", "1e20", "1e-20"])
+    def test_computable_range_boundary_target_accepted(self, target):
+        # 可计算范围边界（量级指数 ±28 含端点）仍受理并精确计算
+        payload = _payload([_agg()])
+        payload["target_dry_total_kg"] = target
+        resp = client.post(URL, json=payload)
+        assert resp.status_code == 200
+        body = resp.json()
+        with localcontext() as ctx:
+            ctx.prec = 80
+            assert body["target_dry_total_kg"] == (
+                f"{Decimal(target).quantize(Decimal('0.001'), rounding=ROUND_HALF_UP):f}"
+            )
+            expected_factor = Decimal(target) / Decimal("100")
+            assert body["scale_factor"] == (
+                f"{expected_factor.quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP):f}"
+            )
 
     def test_tiny_positive_target_accepted(self):
         payload = _payload([_agg()])

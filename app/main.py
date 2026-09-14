@@ -33,6 +33,7 @@ _MESSAGE_MAP = {
     "decimal_parsing": "不是合法的十进制数",
     "string_type": "必须是字符串",
     "list_type": "必须是数组",
+    "extra_forbidden": "无法识别的字段",
 }
 
 
