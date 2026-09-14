@@ -13,9 +13,18 @@ from app.calculator import correct_batch
 from app.sampling_repository import (
     BatchAlreadyConfirmedError,
     BatchNotFoundError,
+    InvalidReadingIndexError,
+    ReadingIndexOutOfBoundsError,
+    RevisionConflictError,
     SamplingBatchRepository,
+    parse_reading_index,
 )
-from app.sampling_schemas import SamplingBatchCreate, SamplingBatchOut
+from app.sampling_schemas import (
+    MoistureReadingRevisionIn,
+    RevisedSamplingBatchOut,
+    SamplingBatchCreate,
+    SamplingBatchOut,
+)
 from app.schemas import CorrectionRequest, CorrectionSheetOut
 from app.summary import build_summary, round3
 
@@ -174,6 +183,70 @@ def create_moisture_batch(
     未知字段、组数越界）由 Pydantic 在入口以 422 拒绝，不落任何数据。
     """
     return sampling_service.create_batch(repo, payload)
+
+
+@app.patch(
+    "/api/v1/moisture-batches/{batch_no}/readings/{index}",
+    response_model=RevisedSamplingBatchOut,
+    summary="修订待确认批次的一组称量（留下审计痕迹）",
+    status_code=200,
+)
+def revise_moisture_batch_reading(
+    batch_no: str,
+    index: str,
+    payload: MoistureReadingRevisionIn,
+    repo: SamplingBatchRepository = Depends(get_sampling_repository),
+) -> RevisedSamplingBatchOut | JSONResponse:
+    """原子替换待确认批次中的一组湿样/干样质量。
+
+    成功时同时递增 revision_no，并保存修改前后质量与修订时间；请求中的
+    revision_no 必须是客户端最新已见值。编号不存在返回 404，下标越界
+    返回定位到 index 的 422；已确认或修订号过期返回 409，冲突不写入读数，
+    也不追加审计记录。
+    """
+    try:
+        reading_index = parse_reading_index(index)
+    except InvalidReadingIndexError:
+        return _error(
+            422,
+            "index",
+            f"读数下标必须是整数：{index}",
+            "reading_index_invalid",
+        )
+    try:
+        return sampling_service.revise_batch_reading(
+            repo, batch_no, reading_index, payload
+        )
+    except BatchNotFoundError:
+        return _error(
+            404,
+            "batch_no",
+            f"取样批次不存在：{batch_no}",
+            "batch_not_found",
+        )
+    except BatchAlreadyConfirmedError:
+        return _error(
+            409,
+            "batch_no",
+            f"取样批次已确认，称量不可修订：{batch_no}",
+            "batch_already_confirmed",
+        )
+    except RevisionConflictError as exc:
+        _batch_no, current, expected = exc.args[0]
+        return _error(
+            409,
+            "revision_no",
+            f"修订号已过期：客户端 {expected}，服务端当前 {current}",
+            "revision_conflict",
+        )
+    except ReadingIndexOutOfBoundsError as exc:
+        _batch_no, bad_index = exc.args[0]
+        return _error(
+            422,
+            "index",
+            f"读数下标越界：{bad_index}",
+            "reading_index_out_of_bounds",
+        )
 
 
 @app.post(

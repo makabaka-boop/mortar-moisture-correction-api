@@ -2,6 +2,7 @@
 
 烘干法原始称量直接成批留痕，不在表外换算百分率：
 - 创建时只接收料堆名称与 2 ~ 5 组湿样/干样质量，以“待确认”保存；
+- 确认前可按批次编号和读数下标修订一组称量，请求同时携带客户端已见修订号；
 - 确认时才由（湿样质量 − 干样质量）÷ 干样质量 × 100 计算各组结果，
   以中位数形成代表含水率并置为“已确认”。
 
@@ -83,6 +84,19 @@ class SamplingBatchCreate(BaseModel):
     )
 
 
+class MoistureReadingRevisionIn(MoistureReadingIn):
+    """待确认批次中单组称量的修订请求。
+
+    复用单组称量的全部质量校验；revision_no 是客户端已见的批次修订号，
+    用于乐观并发控制（新建批次为 0，每次成功修订加 1）。
+    """
+
+    revision_no: int = Field(
+        ge=0,
+        description="客户端已见修订号；与服务端当前值不一致时返回 409",
+    )
+
+
 class MoistureReadingOut(BaseModel):
     """单组称量及其含水率结果（待确认时 moisture_pct 为 null）。
 
@@ -112,4 +126,12 @@ class SamplingBatchOut(BaseModel):
     created_at: str = Field(description="创建时间（UTC ISO 8601）")
     confirmed_at: str | None = Field(
         default=None, description="确认时间（UTC ISO 8601），待确认时为 null"
+    )
+
+
+class RevisedSamplingBatchOut(SamplingBatchOut):
+    """修订接口响应：在原批次契约上补充当前批次修订号。"""
+
+    revision_no: int = Field(
+        description="批次修订号：新建及旧库迁移为 0，每次成功修订单组读数后加 1"
     )

@@ -26,6 +26,18 @@ def _confirm_url(batch_no):
     return f"{CREATE_URL}/{batch_no}/confirm"
 
 
+def _revise_url(batch_no, index):
+    return f"{CREATE_URL}/{batch_no}/readings/{index}"
+
+
+def _revision_payload(wet, dry, revision_no=0):
+    return {
+        "wet_sample_mass": wet,
+        "dry_sample_mass": dry,
+        "revision_no": revision_no,
+    }
+
+
 def _independent_precision(raw_values):
     """独立重写自适应精度估算（与产品公式同数学、不复用代码），供逐位比对。"""
     decimals = [Decimal(v) for v in raw_values]
@@ -92,6 +104,7 @@ class TestCreate:
         assert len(body["batch_no"]) == 19
         assert body["pile_name"] == "雨后1号砂堆"
         assert body["status"] == STATUS_PENDING
+        assert "revision_no" not in body
         assert body["representative_moisture_pct"] is None
         assert body["confirmed_at"] is None
         assert body["created_at"]
@@ -196,6 +209,201 @@ class TestReadingValidation:
         assert resp.status_code == 422
         fields = sorted(e["field"] for e in resp.json()["detail"])
         assert fields == ["readings[0].dry_sample_mass", "readings[1].wet_sample_mass"]
+
+
+class TestReviseReading:
+    def _create_pending(self, readings=None):
+        payload_readings = readings or [
+            _reading("210", "200"),
+            _reading("206", "200"),
+            _reading("110", "100"),
+        ]
+        resp = _create(_payload(payload_readings))
+        assert resp.status_code == 201, resp.text
+        return resp.json()
+
+    def test_revise_then_confirm_uses_latest_reading_and_returns_new_median(
+        self, sampling_repo
+    ):
+        batch = self._create_pending()
+        batch_no = batch["batch_no"]
+        assert "revision_no" not in batch
+
+        resp = client.patch(
+            _revise_url(batch_no, 1),
+            json=_revision_payload("210", "200", revision_no=0),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == STATUS_PENDING
+        assert body["revision_no"] == 1
+        assert [(r["wet_sample_mass"], r["dry_sample_mass"]) for r in body["readings"]] == [
+            ("210", "200"),
+            ("210", "200"),
+            ("110", "100"),
+        ]
+        assert all(r["moisture_pct"] is None for r in body["readings"])
+
+        audits = sampling_repo.list_reading_revisions(batch_no)
+        assert len(audits) == 1
+        assert (
+            audits[0].index,
+            audits[0].old_wet_sample_mass,
+            audits[0].old_dry_sample_mass,
+            audits[0].new_wet_sample_mass,
+            audits[0].new_dry_sample_mass,
+            audits[0].previous_revision_no,
+            audits[0].new_revision_no,
+        ) == (1, "206", "200", "210", "200", 0, 1)
+
+        confirmed = client.post(_confirm_url(batch_no))
+        assert confirmed.status_code == 200
+        confirmed_body = confirmed.json()
+        # 修订后三组均为 5%、5%、10%，中位数为 5.000（修订前中位数是 4.000）
+        assert confirmed_body["representative_moisture_pct"] == "5.000"
+        assert "revision_no" not in confirmed_body
+
+    def test_missing_batch_returns_404(self, sampling_repo):
+        resp = client.patch(
+            _revise_url("MC19990101-00000000", 0),
+            json=_revision_payload("210", "200", 0),
+        )
+        assert resp.status_code == 404
+        detail = resp.json()["detail"][0]
+        assert detail["field"] == "batch_no"
+        assert detail["type"] == "batch_not_found"
+
+    @pytest.mark.parametrize("bad_index", [-1, 2, 99])
+    def test_out_of_bounds_index_returns_422_and_changes_nothing(
+        self, sampling_repo, bad_index
+    ):
+        batch = self._create_pending()
+        resp = client.patch(
+            _revise_url(batch["batch_no"], bad_index),
+            json=_revision_payload("210", "200", 0),
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"][0]
+        assert detail["field"] == "index"
+        assert detail["type"] == "reading_index_out_of_bounds"
+        stored = sampling_repo.get(batch["batch_no"])
+        assert stored.revision_no == 0
+        assert [
+            (r.wet_sample_mass, r.dry_sample_mass) for r in stored.readings
+        ] == [("210", "200"), ("206", "200"), ("110", "100")]
+        assert sampling_repo.list_reading_revisions(batch["batch_no"]) == ()
+
+    def test_non_integer_index_returns_422_located_at_index(self, sampling_repo):
+        batch = self._create_pending()
+        resp = client.patch(
+            f"{CREATE_URL}/{batch['batch_no']}/readings/not-an-index",
+            json=_revision_payload("210", "200", 0),
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "index"
+        assert sampling_repo.get(batch["batch_no"]).revision_no == 0
+
+    def test_confirmed_batch_returns_409_and_cannot_change_reading(self, sampling_repo):
+        batch = self._create_pending()
+        assert client.post(_confirm_url(batch["batch_no"])).status_code == 200
+
+        resp = client.patch(
+            _revise_url(batch["batch_no"], 0),
+            json=_revision_payload("300", "200", 0),
+        )
+        assert resp.status_code == 409
+        detail = resp.json()["detail"][0]
+        assert detail["field"] == "batch_no"
+        assert detail["type"] == "batch_already_confirmed"
+        stored = sampling_repo.get(batch["batch_no"])
+        assert stored.readings[0].wet_sample_mass == "210"
+        assert stored.revision_no == 0
+        assert sampling_repo.list_reading_revisions(batch["batch_no"]) == ()
+
+    def test_stale_revision_returns_409_and_entire_request_rolls_back(
+        self, sampling_repo
+    ):
+        batch = self._create_pending()
+        first = client.patch(
+            _revise_url(batch["batch_no"], 0),
+            json=_revision_payload("220", "200", 0),
+        )
+        assert first.status_code == 200
+        assert first.json()["revision_no"] == 1
+
+        stale = client.patch(
+            _revise_url(batch["batch_no"], 1),
+            json=_revision_payload("210", "200", 0),
+        )
+        assert stale.status_code == 409
+        detail = stale.json()["detail"][0]
+        assert detail["field"] == "revision_no"
+        assert detail["type"] == "revision_conflict"
+        assert "0" in detail["message"] and "1" in detail["message"]
+
+        stored = sampling_repo.get(batch["batch_no"])
+        assert stored.revision_no == 1
+        assert [(r.wet_sample_mass, r.dry_sample_mass) for r in stored.readings] == [
+            ("220", "200"),
+            ("206", "200"),
+            ("110", "100"),
+        ]
+        assert len(sampling_repo.list_reading_revisions(batch["batch_no"])) == 1
+
+    def test_invalid_mass_returns_422_without_reading_revision_or_audit(
+        self, sampling_repo
+    ):
+        batch = self._create_pending()
+        resp = client.patch(
+            _revise_url(batch["batch_no"], 1),
+            json=_revision_payload("200", "200", 0),
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"][0]
+        assert detail["field"] == "dry_sample_mass"
+        assert detail["type"] == "dry_not_below_wet"
+        stored = sampling_repo.get(batch["batch_no"])
+        assert stored.revision_no == 0
+        assert stored.readings[1].wet_sample_mass == "206"
+        assert sampling_repo.list_reading_revisions(batch["batch_no"]) == ()
+
+    def test_unknown_request_field_returns_422(self, sampling_repo):
+        batch = self._create_pending()
+        payload = _revision_payload("210", "200", 0)
+        payload["operator"] = "张工"
+        resp = client.patch(_revise_url(batch["batch_no"], 0), json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "operator"
+        assert sampling_repo.get(batch["batch_no"]).revision_no == 0
+
+    def test_negative_revision_number_returns_422(self, sampling_repo):
+        batch = self._create_pending()
+        resp = client.patch(
+            _revise_url(batch["batch_no"], 0),
+            json=_revision_payload("210", "200", -1),
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["field"] == "revision_no"
+        assert sampling_repo.get(batch["batch_no"]).revision_no == 0
+
+    def test_concurrent_same_old_revision_only_one_writes(self, sampling_repo):
+        from concurrent.futures import ThreadPoolExecutor
+
+        batch = self._create_pending()
+
+        def send(index):
+            return client.patch(
+                _revise_url(batch["batch_no"], index),
+                json=_revision_payload(f"21{index}", "200", 0),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(send, [0, 1]))
+        statuses = sorted(r.status_code for r in responses)
+        assert statuses == [200, 409]
+        stored = sampling_repo.get(batch["batch_no"])
+        assert stored.revision_no == 1
+        assert len(sampling_repo.list_reading_revisions(batch["batch_no"])) == 1
 
 
 class TestConfirm:

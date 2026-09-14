@@ -6,10 +6,15 @@ import pytest
 from app.sampling_repository import (
     BatchAlreadyConfirmedError,
     BatchNotFoundError,
+    InvalidReadingIndexError,
+    LEGACY_SCHEMA,
+    ReadingIndexOutOfBoundsError,
+    RevisionConflictError,
     SamplingBatchRepository,
     SamplingBatchRecord,
     StoredReading,
     default_batch_no_factory,
+    parse_reading_index,
 )
 
 READINGS_3 = [("500.12", "477.72"), ("480.00", "458.50"), ("512.345", "480.005")]
@@ -49,6 +54,7 @@ class TestBatchNoFactory:
 class TestCreate:
     def test_persists_pending_with_original_readings(self, created):
         assert created.status == "待确认"
+        assert created.revision_no == 0
         assert created.pile_name == "雨后1号砂堆"
         assert created.representative_moisture_pct is None
         assert created.confirmed_at is None
@@ -107,6 +113,7 @@ class TestConfirm:
         assert confirmed.representative_moisture_pct == "4.689"
         assert confirmed.confirmed_at
         assert confirmed.confirmed_at >= created.created_at
+        assert confirmed.revision_no == 0
         assert [r.moisture_pct for r in confirmed.readings] == self.PCTS
         # 原始读数不动
         assert [(r.wet_sample_mass, r.dry_sample_mass) for r in confirmed.readings] == READINGS_3
@@ -120,6 +127,21 @@ class TestConfirm:
         assert rec.representative_moisture_pct == "4.689"  # 旧结果原封不动
         assert [r.moisture_pct for r in rec.readings] == self.PCTS
 
+    def test_result_provider_accepts_revised_latest_readings(self, repo, created):
+        repo.revise_reading(created.batch_no, 0, "510", "500", expected_revision_no=0)
+
+        def provider(readings):
+            assert readings[0].wet_sample_mass == "510"
+            return ["2", "5", "7"], "5.000"
+
+        confirmed = repo.confirm(
+            created.batch_no, result_provider=provider
+        )
+        assert confirmed.status == "已确认"
+        assert [r.moisture_pct for r in confirmed.readings] == ["2", "5", "7"]
+        assert confirmed.representative_moisture_pct == "5.000"
+        assert confirmed.revision_no == 1
+
     def test_confirm_missing_batch_raises_404(self, repo):
         with pytest.raises(BatchNotFoundError):
             repo.confirm("MC19990101-DEADBEEF", ["1", "2"], "1.500")
@@ -128,6 +150,183 @@ class TestConfirm:
     def test_get_missing_raises_404(self, repo):
         with pytest.raises(BatchNotFoundError):
             repo.get("不存在")
+
+
+class TestReadingIndexParsing:
+    @pytest.mark.parametrize(("value", "expected"), [("0", 0), ("-1", -1), ("12", 12)])
+    def test_decimal_integer_path_value(self, value, expected):
+        assert parse_reading_index(value) == expected
+
+    @pytest.mark.parametrize("value", ["abc", "1.0", "0x1", "+1", " 1"])
+    def test_invalid_path_value(self, value):
+        with pytest.raises(InvalidReadingIndexError):
+            parse_reading_index(value)
+
+
+class TestReviseReading:
+    def test_replaces_reading_increments_revision_and_writes_audit(self, repo, created):
+        revised = repo.revise_reading(
+            created.batch_no, 1, "490.00", "470.00", expected_revision_no=0
+        )
+
+        assert revised.status == "待确认"
+        assert revised.revision_no == 1
+        assert [(r.wet_sample_mass, r.dry_sample_mass) for r in revised.readings] == [
+            ("500.12", "477.72"),
+            ("490.00", "470.00"),
+            ("512.345", "480.005"),
+        ]
+        assert all(r.moisture_pct is None for r in revised.readings)
+
+        audits = repo.list_reading_revisions(created.batch_no)
+        assert len(audits) == 1
+        audit = audits[0]
+        assert audit.index == 1
+        assert (
+            audit.old_wet_sample_mass,
+            audit.old_dry_sample_mass,
+            audit.new_wet_sample_mass,
+            audit.new_dry_sample_mass,
+        ) == ("480.00", "458.50", "490.00", "470.00")
+        assert (audit.previous_revision_no, audit.new_revision_no) == (0, 1)
+        assert audit.revised_at
+
+    def test_second_revision_requires_latest_revision_number(self, repo, created):
+        repo.revise_reading(created.batch_no, 0, "501", "478", expected_revision_no=0)
+        revised = repo.revise_reading(
+            created.batch_no, 2, "513", "481", expected_revision_no=1
+        )
+        assert revised.revision_no == 2
+        assert [
+            (a.previous_revision_no, a.new_revision_no, a.index)
+            for a in repo.list_reading_revisions(created.batch_no)
+        ] == [(0, 1, 0), (1, 2, 2)]
+
+    def test_stale_revision_conflicts_and_changes_nothing(self, repo, created):
+        before = repo.get(created.batch_no)
+        with pytest.raises(RevisionConflictError):
+            repo.revise_reading(created.batch_no, 0, "501", "478", expected_revision_no=1)
+
+        after = repo.get(created.batch_no)
+        assert after == before
+        assert repo.list_reading_revisions(created.batch_no) == ()
+
+    def test_confirmed_batch_cannot_be_revised(self, repo, created):
+        repo.confirm(created.batch_no, TestConfirm.PCTS, "4.689")
+        with pytest.raises(BatchAlreadyConfirmedError):
+            repo.revise_reading(created.batch_no, 0, "501", "478", expected_revision_no=0)
+        assert repo.get(created.batch_no).revision_no == 0
+        assert repo.list_reading_revisions(created.batch_no) == ()
+
+    @pytest.mark.parametrize("bad_index", [-1, 3, 99])
+    def test_index_out_of_bounds_is_422_domain_error_and_changes_nothing(
+        self, repo, created, bad_index
+    ):
+        before = repo.get(created.batch_no)
+        with pytest.raises(ReadingIndexOutOfBoundsError):
+            repo.revise_reading(
+                created.batch_no, bad_index, "501", "478", expected_revision_no=0
+            )
+        assert repo.get(created.batch_no) == before
+        assert repo.list_reading_revisions(created.batch_no) == ()
+
+    def test_missing_batch_revision_raises_404(self, repo):
+        with pytest.raises(BatchNotFoundError):
+            repo.revise_reading("MC19990101-DEADBEEF", 0, "501", "478", 0)
+
+    def test_audit_insert_failure_rolls_back_reading_and_revision(self, repo, created, monkeypatch):
+        real_execute = sqlite3.Connection.execute
+
+        def failing_audit_execute(conn, sql, params=()):
+            if "INSERT INTO sampling_reading_revisions" in sql:
+                raise RuntimeError("模拟审计写入失败")
+            return real_execute(conn, sql, params)
+
+        monkeypatch.setattr(sqlite3.Connection, "execute", failing_audit_execute)
+        with pytest.raises(RuntimeError):
+            repo.revise_reading(created.batch_no, 0, "501", "478", 0)
+
+        monkeypatch.undo()
+        stored = repo.get(created.batch_no)
+        assert stored.revision_no == 0
+        assert (
+            stored.readings[0].wet_sample_mass,
+            stored.readings[0].dry_sample_mass,
+        ) == READINGS_3[0]
+        assert repo.list_reading_revisions(created.batch_no) == ()
+
+
+class TestLegacyDatabaseMigration:
+    def test_legacy_pending_batch_gets_revision_zero_and_can_be_confirmed(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        with sqlite3.connect(db_path) as raw:
+            raw.executescript(LEGACY_SCHEMA)
+            raw.execute(
+                "INSERT INTO sampling_batches"
+                " (batch_no, pile_name, status, created_at)"
+                " VALUES (?, ?, '待确认', ?)",
+                ("MC20260914-11111111", "旧库砂堆", "2026-09-14T00:00:00+00:00"),
+            )
+            raw.executemany(
+                "INSERT INTO sampling_readings"
+                " (batch_no, ordinal, wet_sample_mass, dry_sample_mass)"
+                " VALUES (?, ?, ?, ?)",
+                [
+                    ("MC20260914-11111111", 0, "210", "200"),
+                    ("MC20260914-11111111", 1, "206", "200"),
+                ],
+            )
+            raw.commit()
+
+        repo = SamplingBatchRepository(db_path)
+        record = repo.get("MC20260914-11111111")
+        assert record.status == "待确认"
+        assert record.revision_no == 0
+        original_confirmed = repo.confirm(
+            "MC20260914-11111111", ["5", "3"], "4.000"
+        )
+        assert original_confirmed.status == "已确认"
+        assert original_confirmed.revision_no == 0
+        assert [r.moisture_pct for r in original_confirmed.readings] == ["5", "3"]
+
+    def test_legacy_pending_batch_can_be_revised_then_confirmed_with_latest_reading(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "legacy_revised.db"
+        with sqlite3.connect(db_path) as raw:
+            raw.executescript(LEGACY_SCHEMA)
+            raw.execute(
+                "INSERT INTO sampling_batches"
+                " (batch_no, pile_name, status, created_at)"
+                " VALUES (?, ?, '待确认', ?)",
+                ("MC20260914-22222222", "旧库砂堆", "2026-09-14T00:00:00+00:00"),
+            )
+            raw.executemany(
+                "INSERT INTO sampling_readings"
+                " (batch_no, ordinal, wet_sample_mass, dry_sample_mass)"
+                " VALUES (?, ?, ?, ?)",
+                [
+                    ("MC20260914-22222222", 0, "210", "200"),
+                    ("MC20260914-22222222", 1, "206", "200"),
+                ],
+            )
+            raw.commit()
+
+        repo = SamplingBatchRepository(db_path)
+        record = repo.get("MC20260914-22222222")
+        assert record.status == "待确认"
+        assert record.revision_no == 0
+        revised = repo.revise_reading(
+            "MC20260914-22222222", 0, "220", "200", expected_revision_no=0
+        )
+        assert revised.revision_no == 1
+        confirmed = repo.confirm(
+            "MC20260914-22222222", ["10", "3"], "6.500"
+        )
+        assert confirmed.status == "已确认"
+        assert confirmed.revision_no == 1
+        assert confirmed.readings[0].wet_sample_mass == "220"
+        assert [r.moisture_pct for r in confirmed.readings] == ["10", "3"]
 
 
 class TestPersistence:
