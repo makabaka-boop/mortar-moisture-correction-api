@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS sampling_readings (
 
 _BATCH_ID_RETRIES = 5
 
+# SQLite INTEGER 为 64 位有符号整数；超出该范围的下标无法绑定查询参数
+_SQLITE_INTEGER_MIN = -(2**63)
+_SQLITE_INTEGER_MAX = 2**63 - 1
+
 
 class BatchNotFoundError(LookupError):
     """批次编号不存在（端点映射为结构化 404）。"""
@@ -346,6 +350,12 @@ class SamplingBatchRepository:
                 raise RevisionConflictError(
                     (batch_no, current_revision_no, expected_revision_no)
                 )
+
+            # 超出 SQLite INTEGER 范围的下标无法绑定查询，与越界一样定位
+            # index 拒绝，而不是让 OverflowError 冒泡为服务器异常
+            if not (_SQLITE_INTEGER_MIN <= index <= _SQLITE_INTEGER_MAX):
+                conn.rollback()
+                raise ReadingIndexOutOfBoundsError((batch_no, index))
 
             old_row = conn.execute(
                 "SELECT wet_sample_mass, dry_sample_mass FROM sampling_readings "

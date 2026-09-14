@@ -230,6 +230,18 @@ class TestReviseReading:
         assert repo.get(created.batch_no) == before
         assert repo.list_reading_revisions(created.batch_no) == ()
 
+    @pytest.mark.parametrize("bad_index", [2**63, -(2**63) - 1, 10**30])
+    def test_index_beyond_sqlite_integer_range_is_domain_error_not_overflow(
+        self, repo, created, bad_index
+    ):
+        before = repo.get(created.batch_no)
+        with pytest.raises(ReadingIndexOutOfBoundsError):
+            repo.revise_reading(
+                created.batch_no, bad_index, "501", "478", expected_revision_no=0
+            )
+        assert repo.get(created.batch_no) == before
+        assert repo.list_reading_revisions(created.batch_no) == ()
+
     def test_missing_batch_revision_raises_404(self, repo):
         with pytest.raises(BatchNotFoundError):
             repo.revise_reading("MC19990101-DEADBEEF", 0, "501", "478", 0)

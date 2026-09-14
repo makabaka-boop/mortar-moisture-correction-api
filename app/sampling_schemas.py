@@ -21,6 +21,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictInt,
     field_validator,
 )
 from pydantic_core import PydanticCustomError
@@ -89,9 +90,12 @@ class MoistureReadingRevisionIn(MoistureReadingIn):
 
     复用单组称量的全部质量校验；revision_no 是客户端已见的批次修订号，
     用于乐观并发控制（新建批次为 0，每次成功修订加 1）。
+
+    revision_no 只接收 JSON 整数：布尔值、小数（如 1.0）与数字字符串
+    一律以 422 拒绝，不做隐式类型转换。
     """
 
-    revision_no: int = Field(
+    revision_no: StrictInt = Field(
         ge=0,
         description="客户端已见修订号；与服务端当前值不一致时返回 409",
     )

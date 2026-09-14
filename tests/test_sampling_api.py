@@ -386,6 +386,36 @@ class TestReviseReading:
         assert resp.json()["detail"][0]["field"] == "revision_no"
         assert sampling_repo.get(batch["batch_no"]).revision_no == 0
 
+    @pytest.mark.parametrize("bad_revision", [True, False, 0.0, 1.0, "0", "1"])
+    def test_non_integer_revision_number_returns_422(self, sampling_repo, bad_revision):
+        batch = self._create_pending()
+        resp = client.patch(
+            _revise_url(batch["batch_no"], 0),
+            json=_revision_payload("210", "200", bad_revision),
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"][0]
+        assert detail["field"] == "revision_no"
+        assert detail["type"] == "int_type"
+        stored = sampling_repo.get(batch["batch_no"])
+        assert stored.revision_no == 0
+        assert stored.readings[0].wet_sample_mass == "210"
+        assert sampling_repo.list_reading_revisions(batch["batch_no"]) == ()
+
+    def test_index_beyond_sqlite_integer_range_returns_422_not_500(self, sampling_repo):
+        batch = self._create_pending()
+        resp = client.patch(
+            _revise_url(batch["batch_no"], 99999999999999999999),
+            json=_revision_payload("210", "200", 0),
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"][0]
+        assert detail["field"] == "index"
+        assert detail["type"] == "reading_index_out_of_bounds"
+        stored = sampling_repo.get(batch["batch_no"])
+        assert stored.revision_no == 0
+        assert sampling_repo.list_reading_revisions(batch["batch_no"]) == ()
+
     def test_concurrent_same_old_revision_only_one_writes(self, sampling_repo):
         from concurrent.futures import ThreadPoolExecutor
 
