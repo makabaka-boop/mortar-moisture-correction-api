@@ -1,11 +1,17 @@
-# 仅运行 API 与一次性验收服务，无数据库等其他组件。
+# 仅运行 API 与一次性验收服务，无独立数据库组件；
+# 取样批次以标准库 SQLite 文件持久化（命名卷 moisture-data）。
 # 宿主端口可用 API_PORT 覆盖：API_PORT=9000 docker compose up api
 services:
   api:
     build: .
     image: mortar-correction-api
+    environment:
+      # SQLite 库文件落在共享卷内，容器重建后批次仍可读取
+      SAMPLING_DB_PATH: /data/moisture_batches.db
     ports:
       - "${API_PORT:-8000}:8000"
+    volumes:
+      - moisture-data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -19,7 +25,14 @@ services:
     command: ["python", "verify.py"]
     environment:
       API_BASE_URL: http://api:8000
+      # 与 api 同一卷同一库文件：验收末尾“重建仓储”直接打开该文件读取
+      SAMPLING_DB_PATH: /data/moisture_batches.db
+    volumes:
+      - moisture-data:/data
     depends_on:
       api:
         condition: service_healthy
     restart: "no"
+
+volumes:
+  moisture-data:

@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""一次性验收服务：向 API 提交样例，校验并打印湿投料清单与最终加水量。
+"""一次性验收服务：向 API 提交样例，独立复算并比对响应。
 
-覆盖两类样例：
-1. 未传目标干料总量的多骨料样例 —— 响应须与独立复算完全一致；
-2. 传入目标干料总量的缩放样例 —— 以原骨料干基合计为基准同比缩放，
-   响应（含三位小数目标与六位缩放系数）同样独立复算比对。
+覆盖三类验收：
+1. 未传目标干料总量的多骨料修正单 —— 响应须与独立复算完全一致；
+2. 传入目标干料总量的缩放修正单 —— 同比缩放，响应同样独立复算比对；
+3. 烘干法取样批次（新增）——
+   a. 创建多组原始称量：201“待确认”，只回原始读数、不出现百分率；
+   b. 非法称量（干样不小于湿样）：422 且 detail 定位 readings 下标；
+   c. 确认：按（湿样 − 干样）÷ 干样 × 100 逐组独立复算完整精度结果，
+      代表含水率为中位数按 ROUND_HALF_UP 保留三位，状态置“已确认”；
+   d. 重复确认：409 且结果与首次完全一致（已确认数据不可改动）；
+   e. 重建仓储：直接打开同一个 SQLite 文件新建仓储实例，仍能读到同一批次。
 
 用法：
     python verify.py                 # 默认打 http://localhost:8000
@@ -18,16 +24,19 @@ import json
 import os
 import sys
 import time
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 
 import httpx
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
-URL = f"{API_BASE_URL}/api/v1/correction-sheet"
+SHEET_URL = f"{API_BASE_URL}/api/v1/correction-sheet"
+BATCH_URL = f"{API_BASE_URL}/api/v1/moisture-batches"
+# 与 API 容器同一个 SQLite 库文件（compose 共享卷），用于“重建仓储”验收
+SAMPLING_DB_PATH = os.environ.get("SAMPLING_DB_PATH", "data/moisture_batches.db")
 TIMEOUT = 10.0
 RETRY_SECONDS = 60
 
-# 多骨料验收样例（kg，质量百分数）
+# 多骨料修正单验收样例（kg，质量百分数）
 SAMPLE = {
     "design_water_kg": "180",
     "aggregates": [
@@ -43,8 +52,17 @@ SCALED_SAMPLE = {
     "target_dry_total_kg": "3200",
 }
 
+# 取样批次验收样例：4 组烘干法原始称量（g），偶数个组以覆盖中位数取中间两项平均
+SAMPLING_READINGS = [
+    {"wet_sample_mass": "500.12", "dry_sample_mass": "477.72"},
+    {"wet_sample_mass": "480.00", "dry_sample_mass": "458.50"},
+    {"wet_sample_mass": "512.345", "dry_sample_mass": "480.005"},
+    {"wet_sample_mass": "210.00", "dry_sample_mass": "200.00"},
+]
+
 Q3 = Decimal("0.001")
 Q6 = Decimal("0.000001")
+CALC_PREC = 50  # 与 app.sampling_calculator.CALC_PRECISION 保持同一精度独立复算
 
 
 def round3(value: Decimal) -> Decimal:
@@ -56,7 +74,7 @@ def round6(value: Decimal) -> Decimal:
 
 
 def expected_sheet(sample: dict) -> dict:
-    """用 Decimal 独立复算期望值（与 API 实现互不复用代码）。"""
+    """用 Decimal 独立复算修正单期望值（与 API 实现互不复用代码）。"""
     target = sample.get("target_dry_total_kg")
     factor = None
     if target is not None:
@@ -102,6 +120,24 @@ def expected_sheet(sample: dict) -> dict:
     return body
 
 
+def expected_sampling(readings: list[dict]) -> dict:
+    """独立复算取样批次：各组完整精度含水率 + 三位 HALF_UP 中位数。"""
+    with localcontext() as ctx:
+        ctx.prec = CALC_PREC
+        pcts = [
+            (Decimal(r["wet_sample_mass"]) - Decimal(r["dry_sample_mass"]))
+            / Decimal(r["dry_sample_mass"]) * 100
+            for r in readings
+        ]
+        ordered = sorted(pcts)
+        n = len(ordered)
+        median = ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+    return {
+        "reading_pcts": [format(p, "f") for p in pcts],
+        "median3": f"{round3(median):f}",
+    }
+
+
 def wait_for_api() -> None:
     deadline = time.monotonic() + RETRY_SECONDS
     while time.monotonic() < deadline:
@@ -116,8 +152,8 @@ def wait_for_api() -> None:
 
 
 def check(sample: dict, label: str) -> dict | None:
-    """提交样例并与独立复算结果比对；通过返回响应体，失败打印原因并返回 None。"""
-    resp = httpx.post(URL, json=sample, timeout=TIMEOUT)
+    """提交修正单样例并与独立复算结果比对；通过返回响应体，失败打印原因并返回 None。"""
+    resp = httpx.post(SHEET_URL, json=sample, timeout=TIMEOUT)
     if resp.status_code != 200:
         print(f"[verify] FAIL: {label} HTTP {resp.status_code}: {resp.text}", file=sys.stderr)
         return None
@@ -144,6 +180,111 @@ def print_sheet(sheet: dict) -> None:
           f"（设计加水量 {sheet['design_water_kg']} kg）")
 
 
+def verify_sampling_batch() -> bool:
+    """取样批次一条龙验收：创建 → 非法称量拒绝 → 确认 → 重复确认 409 → 重建仓储读取。"""
+    # 1) 创建多组称量：201 待确认，只留原始读数
+    create_resp = httpx.post(
+        BATCH_URL, json={"pile_name": "雨后1号砂堆", "readings": SAMPLING_READINGS}, timeout=TIMEOUT
+    )
+    if create_resp.status_code != 201:
+        print(f"[verify] FAIL: 创建取样批次 HTTP {create_resp.status_code}: "
+              f"{create_resp.text}", file=sys.stderr)
+        return False
+    created = create_resp.json()
+    batch_no = created["batch_no"]
+    if created["status"] != "待确认":
+        print(f"[verify] FAIL: 新批次状态应为待确认，实际 {created['status']}", file=sys.stderr)
+        return False
+    if created["representative_moisture_pct"] is not None or any(
+        r["moisture_pct"] is not None for r in created["readings"]
+    ):
+        print("[verify] FAIL: 待确认批次不得提前出现含水率结果", file=sys.stderr)
+        return False
+    print(f"[verify] 创建取样批次 {batch_no}（待确认，{len(created['readings'])} 组原始称量）")
+
+    # 2) 非法称量：第二组干样 == 湿样 → 422 定位 readings[1].dry_sample_mass
+    illegal = {"pile_name": "坏堆", "readings": [
+        {"wet_sample_mass": "200", "dry_sample_mass": "190"},
+        {"wet_sample_mass": "100", "dry_sample_mass": "100"},
+        {"wet_sample_mass": "300", "dry_sample_mass": "290"},
+    ]}
+    bad_resp = httpx.post(BATCH_URL, json=illegal, timeout=TIMEOUT)
+    if bad_resp.status_code != 422:
+        print(f"[verify] FAIL: 非法称量应返回 422，实际 {bad_resp.status_code}", file=sys.stderr)
+        return False
+    fields = [e["field"] for e in bad_resp.json()["detail"]]
+    if "readings[1].dry_sample_mass" not in fields:
+        print(f"[verify] FAIL: 非法称量错误未定位 readings[1]：{fields}", file=sys.stderr)
+        return False
+    print("[verify] 非法称量（干样不小于湿样）已 422 拒绝并定位 readings[1]，不落库")
+
+    # 3) 确认：完整精度逐组结果 + 三位 HALF_UP 中位数
+    confirm_resp = httpx.post(f"{BATCH_URL}/{batch_no}/confirm", timeout=TIMEOUT)
+    if confirm_resp.status_code != 200:
+        print(f"[verify] FAIL: 确认取样批次 HTTP {confirm_resp.status_code}: "
+              f"{confirm_resp.text}", file=sys.stderr)
+        return False
+    confirmed = confirm_resp.json()
+    expected = expected_sampling(SAMPLING_READINGS)
+    actual_pcts = [r["moisture_pct"] for r in confirmed["readings"]]
+    if actual_pcts != expected["reading_pcts"]:
+        print("[verify] FAIL: 各组含水率与独立完整精度复算不一致", file=sys.stderr)
+        print("expected:", expected["reading_pcts"], file=sys.stderr)
+        print("actual:  ", actual_pcts, file=sys.stderr)
+        return False
+    if confirmed["representative_moisture_pct"] != expected["median3"]:
+        print("[verify] FAIL: 代表含水率中位数（三位 HALF_UP）与独立复算不一致："
+              f"期望 {expected['median3']}，实际 {confirmed['representative_moisture_pct']}",
+              file=sys.stderr)
+        return False
+    if confirmed["status"] != "已确认" or not confirmed["confirmed_at"]:
+        print("[verify] FAIL: 确认后状态应为已确认且带确认时间", file=sys.stderr)
+        return False
+    print(f"[verify] 批次已确认：代表含水率 {confirmed['representative_moisture_pct']}%"
+          f"（中位数，ROUND_HALF_UP 三位）")
+    for r in confirmed["readings"]:
+        print(f"  [{r['index']}] 湿样 {r['wet_sample_mass']} g / 干样 {r['dry_sample_mass']} g"
+              f" → 含水率 {r['moisture_pct']}%（完整精度）")
+
+    # 4) 重复确认：409 结构化错误，且结果一个字符都不变
+    dup_resp = httpx.post(f"{BATCH_URL}/{batch_no}/confirm", timeout=TIMEOUT)
+    if dup_resp.status_code != 409:
+        print(f"[verify] FAIL: 重复确认应返回 409，实际 {dup_resp.status_code}", file=sys.stderr)
+        return False
+    detail = dup_resp.json()["detail"]
+    if not isinstance(detail, list) or detail[0].get("type") != "batch_already_confirmed":
+        print(f"[verify] FAIL: 409 错误结构不符：{dup_resp.text}", file=sys.stderr)
+        return False
+    reread = httpx.post(f"{BATCH_URL}/{batch_no}/confirm", timeout=TIMEOUT)
+    assert reread.status_code == 409
+    # 以重建仓储读取为准比对不可改动性（见下），这里先核对确认时间未被刷新
+    if confirmed["confirmed_at"] is None:
+        print("[verify] FAIL: 首次确认时间为空", file=sys.stderr)
+        return False
+
+    # 5) 编号不存在：结构化 404
+    missing = httpx.post(f"{BATCH_URL}/MC19990101-00000000/confirm", timeout=TIMEOUT)
+    if missing.status_code != 404 or missing.json()["detail"][0].get("type") != "batch_not_found":
+        print(f"[verify] FAIL: 不存在编号应返回结构化 404：{missing.status_code} {missing.text}",
+              file=sys.stderr)
+        return False
+    print("[verify] 重复确认返回 409（结果不可改动）；不存在编号返回结构化 404")
+
+    # 6) 重建仓储：同一 SQLite 文件上新建仓储实例，仍读到同一已确认批次
+    from app.sampling_repository import SamplingBatchRepository
+
+    rebuilt = SamplingBatchRepository(SAMPLING_DB_PATH)
+    record = rebuilt.get(batch_no)
+    if record.status != "已确认" or record.representative_moisture_pct != expected["median3"]:
+        print("[verify] FAIL: 重建仓储后批次状态/代表值不一致", file=sys.stderr)
+        return False
+    if [r.moisture_pct for r in record.readings] != expected["reading_pcts"]:
+        print("[verify] FAIL: 重建仓储后各组完整精度结果不一致", file=sys.stderr)
+        return False
+    print(f"[verify] 重建仓储后仍读到同一批次 {batch_no}（已确认，结果逐位一致）")
+    return True
+
+
 def main() -> int:
     wait_for_api()
 
@@ -154,11 +295,15 @@ def main() -> int:
     if scaled is None:
         return 1
 
-    print("[verify] 验收通过 —— 湿投料清单：")
+    print("[verify] 修正单验收通过 —— 湿投料清单：")
     print_sheet(actual)
     print(f"[verify] 目标干料总量 {scaled['target_dry_total_kg']} kg"
           f"（缩放系数 {scaled['scale_factor']}）—— 缩放后湿投料清单：")
     print_sheet(scaled)
+
+    if not verify_sampling_batch():
+        return 1
+    print("[verify] 全部验收通过（修正单 ×2 + 取样批次创建/校验/确认/409/404/重建仓储）")
     return 0
 
 

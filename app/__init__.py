@@ -1,8 +1,15 @@
 """预拌砂浆含水修正 API。
 
-模块划分：
-- app.schemas    请求校验（Pydantic 契约）
+模块划分（修正单）：
+- app.schemas    修正单请求校验（Pydantic 契约）
 - app.calculator 修正计算（纯 Decimal，中间值完整精度）
 - app.summary    批次汇总（ROUND_HALF_UP 三位小数舍入与响应组装）
+
+模块划分（取样批次）：
+- app.sampling_schemas     取样批次契约（2~5 组湿样/干样称量）
+- app.sampling_calculator  各组含水率与中位数（完整精度）
+- app.sampling_repository  SQLite 仓储（整批事务、条件确认、重建可读）
+- app.sampling_service     创建/确认编排与响应组装
+
 - app.main       FastAPI 装配与错误反馈
 """
