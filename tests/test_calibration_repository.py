@@ -141,6 +141,7 @@ class TestImmutability:
         "sql",
         [
             "UPDATE calibration_curves SET sensor_id='X'",
+            "UPDATE calibration_curves SET sealed=0",
             "DELETE FROM calibration_curves",
             "UPDATE calibration_points SET raw_signal='9'",
             "DELETE FROM calibration_points",
@@ -154,14 +155,86 @@ class TestImmutability:
         # 触发器 ABORT 后记录原样可读
         assert repo.get(created.curve_no) == created
 
+    def test_direct_append_after_seal_blocked_and_conversion_basis_unchanged(
+        self, repo, created, tmp_path
+    ):
+        """绕过仓储向已固化曲线追加下一个 ordinal 的点：触发器拒绝，点数不变。
+
+        这是本次漏洞：外键满足、主键不冲突的新点此前可以直接 INSERT，
+        固化的换算依据随之改变。
+        """
+        with sqlite3.connect(tmp_path / "calibration.db") as raw:  # 默认不启用外键
+            with pytest.raises(sqlite3.IntegrityError):
+                raw.execute(
+                    "INSERT INTO calibration_points"
+                    " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+                    " VALUES (?, 3, '999.0', '40')",
+                    (created.curve_no,),
+                )
+        assert repo.count_points(created.curve_no) == len(created.points)
+        # 换算依据逐位不变
+        assert repo.get(created.curve_no) == created
+
+    def test_orphan_point_insert_blocked_when_foreign_keys_off(
+        self, repo, created, tmp_path
+    ):
+        """外键未启用时，向不存在的曲线插点同样被触发器拒绝（COALESCE → 已固化）。"""
+        with sqlite3.connect(tmp_path / "calibration.db") as raw:
+            with pytest.raises(sqlite3.IntegrityError):
+                raw.execute(
+                    "INSERT INTO calibration_points"
+                    " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+                    " VALUES ('CC-NOT-EXISTS', 0, '1', '2')"
+                )
+
+    def test_seal_update_failure_rolls_back_entire_curve(self, tmp_path):
+        """固化更新（sealed 0 → 1）失败：未固化主行与已插入点随事务整体回滚。"""
+        class _FailingConnection:
+            """仅拦截固化 UPDATE 的连接代理，其余方法委托真实 sqlite 连接。"""
+
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, params=()):
+                if sql.startswith("UPDATE calibration_curves SET sealed=1"):
+                    raise RuntimeError("模拟固化阶段失败")
+                return self._real.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._real.__exit__(*exc)
+
+        class FailOnSeal(CalibrationCurveRepository):
+            def _connect(self):
+                return _FailingConnection(super()._connect())
+
+        failing_repo = FailOnSeal(tmp_path / "sealfail.db")
+        with pytest.raises(RuntimeError):
+            failing_repo.create("封不住曲线", POINTS_3)
+        with sqlite3.connect(tmp_path / "sealfail.db") as raw:
+            assert raw.execute("SELECT COUNT(*) FROM calibration_curves").fetchone()[0] == 0
+            assert raw.execute("SELECT COUNT(*) FROM calibration_points").fetchone()[0] == 0
+
     def test_record_intact_after_blocked_mutations(self, repo, created, tmp_path):
         with sqlite3.connect(tmp_path / "calibration.db") as raw:
-            for sql in [
+            statements = [
                 "UPDATE calibration_curves SET sensor_id='X'",
+                "UPDATE calibration_curves SET sealed=0",
                 "DELETE FROM calibration_curves",
                 "UPDATE calibration_points SET raw_signal='9'",
                 "DELETE FROM calibration_points",
-            ]:
+                (
+                    "INSERT INTO calibration_points"
+                    " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+                    f" VALUES ('{created.curve_no}', 3, '9', '40')"
+                ),
+            ]
+            for sql in statements:
                 with pytest.raises(sqlite3.IntegrityError):
                     raw.execute(sql)
                 raw.rollback()
@@ -170,6 +243,14 @@ class TestImmutability:
 
 
 class TestPersistence:
+    def test_curve_is_sealed_immediately_after_commit(self, repo, created, tmp_path):
+        with sqlite3.connect(tmp_path / "calibration.db") as raw:
+            sealed = raw.execute(
+                "SELECT sealed FROM calibration_curves WHERE curve_no=?",
+                (created.curve_no,),
+            ).fetchone()[0]
+        assert sealed == 1
+
     def test_rebuilt_repository_reads_same_curve(self, repo, created, tmp_path):
         rebuilt = CalibrationCurveRepository(tmp_path / "calibration.db")
         record = rebuilt.get(created.curve_no)
@@ -202,3 +283,51 @@ class TestCoexistWithSamplingDatabase:
         CalibrationCurveRepository(db_path)
         assert sampling.count_batches() == 1
         assert calibration.count_curves() == 1
+
+
+class TestLegacyDatabaseMigration:
+    """引入 sealed 之前的校准库：补 sealed=1，既有曲线立即不可追加。"""
+
+    def test_legacy_curve_gets_sealed_and_cannot_be_appended(self, tmp_path):
+        from app.calibration_repository import LEGACY_SCHEMA
+
+        db_path = tmp_path / "legacy_cal.db"
+        curve_no = "CC20260913-LEGACY01"
+        with sqlite3.connect(db_path) as raw:
+            raw.executescript(LEGACY_SCHEMA)
+            raw.execute(
+                "INSERT INTO calibration_curves (curve_no, sensor_id, created_at)"
+                " VALUES (?, '旧探头', '2026-09-13T00:00:00+00:00')",
+                (curve_no,),
+            )
+            raw.executemany(
+                "INSERT INTO calibration_points"
+                " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+                " VALUES (?, ?, ?, ?)",
+                [
+                    (curve_no, 0, "1", "0"),
+                    (curve_no, 1, "2", "5"),
+                    (curve_no, 2, "3", "40"),
+                ],
+            )
+            raw.commit()
+
+        repo = CalibrationCurveRepository(db_path)  # 触发迁移与触发器重建
+        with sqlite3.connect(db_path) as raw:
+            assert raw.execute(
+                "SELECT sealed FROM calibration_curves WHERE curve_no=?", (curve_no,)
+            ).fetchone()[0] == 1
+            # 外键默认关闭，触发器也必须拦住对旧曲线的追加
+            with pytest.raises(sqlite3.IntegrityError):
+                raw.execute(
+                    "INSERT INTO calibration_points"
+                    " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+                    " VALUES (?, 3, '4', '40')",
+                    (curve_no,),
+                )
+        record = repo.get(curve_no)
+        assert record.sensor_id == "旧探头"
+        assert len(record.points) == 3
+        # 迁移后新建曲线仍走 0 → 1 固化流程，正常可读
+        new_curve = repo.create("新探头", POINTS_3)
+        assert new_curve.points[0].raw_signal == "4.0"

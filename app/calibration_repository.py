@@ -7,8 +7,13 @@
 写入保证整批：曲线主行与 3 ~ 8 行对照点在同一事务内提交，中途任何异常
 都整体回滚，不留半截曲线；失败时不产生或改写任何记录。
 
-不可变保证：曲线一经提交，仓储不提供任何更新/删除入口；并在库内以触发器
-拒绝 UPDATE/DELETE，即使绕过仓储直接打开同一文件也无法改写或删除曲线。
+不可变保证：曲线一经提交，仓储不提供任何更新/删除/追加入口；并在库内以
+触发器拒绝 UPDATE/DELETE/INSERT，即使绕过仓储直接打开同一文件也无法改写、
+删除曲线，或向已固化曲线追加新对照点（追加点同样会改变换算依据）。
+
+实现方式：主行带 sealed 标志——创建事务内先以 sealed=0 落主行并插入对照点，
+同事务末尾才翻转为 1；触发器只允许向 sealed=0 的曲线插入点，只允许 sealed
+0 → 1（其余列不变）这一次固化更新。旧库迁移时既有曲线一律补 sealed=1。
 
 仓储只负责存取：原始信号与参考含水率按原始读数字符串原样落库，插值由
 calibration_calculator 完成。
@@ -28,6 +33,24 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS calibration_curves (
     curve_no    TEXT PRIMARY KEY,
     sensor_id   TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    sealed      INTEGER NOT NULL DEFAULT 1 CHECK (sealed IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS calibration_points (
+    curve_no                    TEXT NOT NULL
+        REFERENCES calibration_curves(curve_no) ON DELETE CASCADE,
+    ordinal                     INTEGER NOT NULL CHECK (ordinal >= 0),
+    raw_signal                  TEXT NOT NULL,
+    reference_moisture_pct      TEXT NOT NULL,
+    PRIMARY KEY (curve_no, ordinal)
+);
+"""
+
+# 引入 sealed 之前的旧表结构（旧库迁移测试用）
+LEGACY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS calibration_curves (
+    curve_no    TEXT PRIMARY KEY,
+    sensor_id   TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS calibration_points (
@@ -40,24 +63,45 @@ CREATE TABLE IF NOT EXISTS calibration_points (
 );
 """
 
-# 不可变触发器：拒绝绕过仓储直接改写/删除曲线或对照点（IF NOT EXISTS 重复初始化安全）
+# 不可变触发器：固化（sealed=1）后，绕过仓储直接改写/删除/追加都被拒绝。
+# 主行更新仅放行创建事务末尾的 sealed 0 → 1（且 sensor_id/created_at 不变）；
+# 对照点仅在其所属曲线 sealed=0（创建事务进行中）时允许 INSERT。
+# 每次初始化先 DROP 再建，保证定义升级后重复打开同一文件也会刷新触发器。
 IMMUTABILITY_TRIGGERS = """
-CREATE TRIGGER IF NOT EXISTS trg_calibration_curves_no_update
+DROP TRIGGER IF EXISTS trg_calibration_curves_no_update;
+CREATE TRIGGER trg_calibration_curves_no_update
 BEFORE UPDATE ON calibration_curves
+WHEN NOT (OLD.sealed = 0 AND NEW.sealed = 1
+          AND NEW.curve_no = OLD.curve_no
+          AND NEW.sensor_id = OLD.sensor_id
+          AND NEW.created_at = OLD.created_at)
 BEGIN
-    SELECT RAISE(ABORT, '校准曲线为不可变记录，禁止更新');
+    SELECT RAISE(ABORT, '校准曲线为不可变记录，除固化外禁止更新');
 END;
-CREATE TRIGGER IF NOT EXISTS trg_calibration_curves_no_delete
+DROP TRIGGER IF EXISTS trg_calibration_curves_no_delete;
+CREATE TRIGGER trg_calibration_curves_no_delete
 BEFORE DELETE ON calibration_curves
 BEGIN
     SELECT RAISE(ABORT, '校准曲线为不可变记录，禁止删除');
 END;
-CREATE TRIGGER IF NOT EXISTS trg_calibration_points_no_update
+DROP TRIGGER IF EXISTS trg_calibration_points_no_insert;
+CREATE TRIGGER trg_calibration_points_no_insert
+BEFORE INSERT ON calibration_points
+WHEN COALESCE(
+    (SELECT sealed FROM calibration_curves WHERE curve_no = NEW.curve_no),
+    1
+) <> 0
+BEGIN
+    SELECT RAISE(ABORT, '校准曲线已固化或不存在，禁止追加对照点');
+END;
+DROP TRIGGER IF EXISTS trg_calibration_points_no_update;
+CREATE TRIGGER trg_calibration_points_no_update
 BEFORE UPDATE ON calibration_points
 BEGIN
     SELECT RAISE(ABORT, '校准曲线为不可变记录，对照点禁止更新');
 END;
-CREATE TRIGGER IF NOT EXISTS trg_calibration_points_no_delete
+DROP TRIGGER IF EXISTS trg_calibration_points_no_delete;
+CREATE TRIGGER trg_calibration_points_no_delete
 BEFORE DELETE ON calibration_points
 BEGIN
     SELECT RAISE(ABORT, '校准曲线为不可变记录，对照点禁止删除');
@@ -137,7 +181,9 @@ class CalibrationCurveRepository:
         *,
         now: Callable[[], str] = utc_now_iso,
     ) -> CalibrationCurveRecord:
-        """整批写入不可变曲线：主行与全部对照点同一事务提交或一起回滚。
+        """整批写入不可变曲线：主行（先 sealed=0）与全部对照点在同一事务
+        内插入，末尾把 sealed 翻转为 1 后一起提交；任一步失败整体回滚，
+        不会留下未固化或半截曲线。
 
         points 为 (原始信号原始串, 参考含水率原始串)，顺序即下标。
         """
@@ -149,11 +195,18 @@ class CalibrationCurveRepository:
             curve_no = self._unique_curve_no(conn)
             created_at = now()
             conn.execute(
-                "INSERT INTO calibration_curves (curve_no, sensor_id, created_at)"
-                " VALUES (?, ?, ?)",
+                "INSERT INTO calibration_curves (curve_no, sensor_id, created_at, sealed)"
+                " VALUES (?, ?, ?, 0)",
                 (curve_no, sensor_id, created_at),
             )
             self._insert_points(conn, curve_no, points)
+            # 同事务内固化：触发器只放行 sealed 0 → 1 这一次更新；
+            # 提交后任何连接都无法再向该曲线 INSERT 对照点
+            conn.execute(
+                "UPDATE calibration_curves SET sealed=1"
+                " WHERE curve_no=? AND sealed=0",
+                (curve_no,),
+            )
             conn.commit()
         except BaseException:
             try:
@@ -220,9 +273,26 @@ class CalibrationCurveRepository:
         """在既有库文件上追加校准曲线两表与不可变触发器。
 
         取样批次等既有表不受影响；IF NOT EXISTS 保证对同一文件重复初始化安全。
+        触发器每次 DROP 后重建，使旧版本定义随仓储升级而刷新。
         """
         conn.executescript(SCHEMA)
+        CalibrationCurveRepository._migrate_sealed(conn)
         conn.executescript(IMMUTABILITY_TRIGGERS)
+
+    @staticmethod
+    def _migrate_sealed(conn: sqlite3.Connection) -> None:
+        """引入 sealed 之前的旧库补列：既有曲线一律视为已固化（sealed=1）。
+
+        ADD COLUMN 的 NOT NULL DEFAULT 1 会原子地给既有曲线补 1；
+        新库建表时已带该列，此处幂等跳过。
+        """
+        columns = conn.execute("PRAGMA table_info(calibration_curves)").fetchall()
+        if "sealed" not in {column[1] for column in columns}:
+            conn.execute(
+                "ALTER TABLE calibration_curves "
+                "ADD COLUMN sealed INTEGER NOT NULL DEFAULT 1"
+            )
+            conn.execute("UPDATE calibration_curves SET sealed=1")
 
     def _unique_curve_no(self, conn: sqlite3.Connection) -> str:
         """在事务内取未占用的曲线编号，极小概率冲突时换号重试。"""

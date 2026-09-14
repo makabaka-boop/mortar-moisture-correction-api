@@ -22,7 +22,8 @@
    c. 非法点集（重复信号点、参考含水率越 0~40、点数不匹配、未知字段）：422
       且库内曲线数不增加（失败时不产生或改写记录）；
    d. 未知曲线：结构化 404；信号越界：定位到 raw_signal 的 422，不做外推；
-   e. 不可变：绕过仓储直接 UPDATE/DELETE 同一 SQLite 文件被触发器拒绝；
+   e. 不可变：绕过仓储/API 直接 INSERT（追加对照点）/UPDATE/DELETE 同一 SQLite
+      文件（含把 sealed 改回 0）均被触发器拒绝，换算依据逐位不变；
    f. 与取样批次共库迁移：同一文件上两模块表并存，重建仓储仍读到同一曲线。
 
 用法：
@@ -770,20 +771,41 @@ def verify_calibration_curve() -> bool:
             return False
     print("[verify] 未知曲线返回结构化 404；信号越界返回定位到 raw_signal 的 422（不做外推）")
 
-    # 5) 不可变：绕过仓储直接 UPDATE/DELETE 同一 SQLite 文件被触发器拒绝
+    # 5) 不可变：绕过仓储/API 直接 UPDATE/DELETE/INSERT 同一 SQLite 文件都被触发器拒绝
     import sqlite3 as _sqlite3
 
-    with _sqlite3.connect(SAMPLING_DB_PATH) as raw:
-        for sql in (
-            f"UPDATE calibration_curves SET sensor_id='HACK' WHERE curve_no='{curve_no}'",
-            f"DELETE FROM calibration_curves WHERE curve_no='{curve_no}'",
-            "UPDATE calibration_points SET raw_signal='1'",
-            "DELETE FROM calibration_points",
-        ):
+    # (SQL, 参数, 说明)；INSERT 使用下一个 ordinal，外键满足、主键不冲突
+    direct_writes = [
+        (
+            "UPDATE calibration_curves SET sensor_id='HACK' WHERE curve_no=?",
+            (curve_no,), "改传感器编号",
+        ),
+        (
+            "UPDATE calibration_curves SET sealed=0 WHERE curve_no=?",
+            (curve_no,), "解除固化标志",
+        ),
+        ("DELETE FROM calibration_curves WHERE curve_no=?", (curve_no,), "删除曲线"),
+        ("UPDATE calibration_points SET raw_signal='1'", (), "改对照点"),
+        ("DELETE FROM calibration_points", (), "删除对照点"),
+        (
+            "INSERT INTO calibration_points"
+            " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+            " VALUES (?, ?, '999.0', '40')",
+            (curve_no, len(CALIBRATION_POINTS)), "追加新对照点",
+        ),
+        (
+            "INSERT INTO calibration_points"
+            " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+            " VALUES ('CC19990101-00000000', 0, '1', '2')",
+            (), "向不存在的曲线插点",
+        ),
+    ]
+    with _sqlite3.connect(SAMPLING_DB_PATH) as raw:  # 默认不启用外键
+        for sql, params, label in direct_writes:
             try:
-                raw.execute(sql)
+                raw.execute(sql, params)
                 raw.commit()
-                print(f"[verify] FAIL: 不可变触发器未拦截：{sql}", file=sys.stderr)
+                print(f"[verify] FAIL: 不可变触发器未拦截{label}：{sql}", file=sys.stderr)
                 return False
             except _sqlite3.IntegrityError:
                 raw.rollback()
@@ -791,7 +813,19 @@ def verify_calibration_curve() -> bool:
     if unchanged.sensor_id != CALIBRATION_PAYLOAD["sensor_id"]:
         print("[verify] FAIL: 触发器拒绝后曲线被改动", file=sys.stderr)
         return False
-    print("[verify] 曲线不可变：直接改写/删除 SQLite 记录被触发器拒绝，仓储也无更新/删除入口")
+    if check_repo.count_points(curve_no) != len(CALIBRATION_POINTS):
+        print("[verify] FAIL: 追加尝试后对照点数发生变化", file=sys.stderr)
+        return False
+    # 追加被拒后换算依据不变：逐点复算结果仍与独立复算一致
+    for raw_signal in CONVERSION_CHECKS:
+        resp = httpx.post(
+            CONVERT_URL, json={"curve_no": curve_no, "raw_signal": raw_signal}, timeout=TIMEOUT
+        )
+        expected = expected_conversion(CALIBRATION_POINTS, raw_signal)
+        if resp.json().get("moisture_pct") != expected["moisture_pct"]:
+            print(f"[verify] FAIL: 追加尝试后换算依据变化（信号 {raw_signal}）", file=sys.stderr)
+            return False
+    print("[verify] 曲线不可变：直接改写/删除/追加/解封均被触发器拒绝，换算依据逐位不变")
 
     # 6) 共库重建：与取样批次同文件，新建仓储实例仍读到同一曲线（迁移幂等）
     rebuilt = CalibrationCurveRepository(SAMPLING_DB_PATH)
