@@ -63,6 +63,17 @@ CREATE TABLE IF NOT EXISTS calibration_points (
 );
 """
 
+# 升级前先丢弃各历史版本的校准触发器：DROP TRIGGER 不触发任何触发器，
+# IF EXISTS 保证全新库/无触发器的旧库重复执行也不报错。旧版无条件拒绝
+# UPDATE 的触发器必须在 sealed 回填 UPDATE 之前清掉，否则升级会被 ABORT。
+DROP_LEGACY_TRIGGERS = """
+DROP TRIGGER IF EXISTS trg_calibration_curves_no_update;
+DROP TRIGGER IF EXISTS trg_calibration_curves_no_delete;
+DROP TRIGGER IF EXISTS trg_calibration_points_no_insert;
+DROP TRIGGER IF EXISTS trg_calibration_points_no_update;
+DROP TRIGGER IF EXISTS trg_calibration_points_no_delete;
+"""
+
 # 不可变触发器：固化（sealed=1）后，绕过仓储直接改写/删除/追加都被拒绝。
 # 主行更新仅放行创建事务末尾的 sealed 0 → 1（且 sensor_id/created_at 不变）；
 # 对照点仅在其所属曲线 sealed=0（创建事务进行中）时允许 INSERT。
@@ -270,12 +281,16 @@ class CalibrationCurveRepository:
 
     @staticmethod
     def _initialize_schema(conn: sqlite3.Connection) -> None:
-        """在既有库文件上追加校准曲线两表与不可变触发器。
+        """在既有库文件上追加校准曲线两表与不可变触发器（含旧版升级）。
 
         取样批次等既有表不受影响；IF NOT EXISTS 保证对同一文件重复初始化安全。
-        触发器每次 DROP 后重建，使旧版本定义随仓储升级而刷新。
+
+        顺序必须是：建表 → **先丢弃全部旧版触发器** → 加 sealed 列并回填 →
+        再建新触发器。上一版库的 UPDATE 触发器无条件拒绝一切更新，若先回填
+        sealed=1 会被它 ABORT，导致带曲线的旧库打不开。
         """
         conn.executescript(SCHEMA)
+        conn.executescript(DROP_LEGACY_TRIGGERS)
         CalibrationCurveRepository._migrate_sealed(conn)
         conn.executescript(IMMUTABILITY_TRIGGERS)
 
@@ -284,7 +299,9 @@ class CalibrationCurveRepository:
         """引入 sealed 之前的旧库补列：既有曲线一律视为已固化（sealed=1）。
 
         ADD COLUMN 的 NOT NULL DEFAULT 1 会原子地给既有曲线补 1；
-        新库建表时已带该列，此处幂等跳过。
+        新库建表时已带该列，此处幂等跳过。调用前旧触发器必须已丢弃
+        （见 _initialize_schema 的顺序），否则回填 UPDATE 会被旧版
+        无条件拒绝更新的触发器 ABORT。
         """
         columns = conn.execute("PRAGMA table_info(calibration_curves)").fetchall()
         if "sealed" not in {column[1] for column in columns}:

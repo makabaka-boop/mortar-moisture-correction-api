@@ -11,6 +11,52 @@ from app.calibration_repository import (
     default_curve_no_factory,
 )
 
+# 引入 sealed 之前的线上版本：四触发器命名，且 UPDATE 触发器无条件 ABORT
+LEGACY_V1_TRIGGERS = """
+CREATE TRIGGER trg_calibration_curves_no_update
+BEFORE UPDATE ON calibration_curves
+BEGIN
+    SELECT RAISE(ABORT, '校准曲线为不可变记录，禁止更新');
+END;
+CREATE TRIGGER trg_calibration_curves_no_delete
+BEFORE DELETE ON calibration_curves
+BEGIN
+    SELECT RAISE(ABORT, '校准曲线为不可变记录，禁止删除');
+END;
+CREATE TRIGGER trg_calibration_points_no_update
+BEFORE UPDATE ON calibration_points
+BEGIN
+    SELECT RAISE(ABORT, '校准曲线为不可变记录，对照点禁止更新');
+END;
+CREATE TRIGGER trg_calibration_points_no_delete
+BEFORE DELETE ON calibration_points
+BEGIN
+    SELECT RAISE(ABORT, '校准曲线为不可变记录，对照点禁止删除');
+END;
+"""
+
+
+def _create_v1_database(db_path, curves):
+    """按引入 sealed 之前的线上版本造库：旧两表 + 四个旧触发器 + 给定曲线。"""
+    from app.calibration_repository import LEGACY_SCHEMA
+
+    with sqlite3.connect(db_path) as raw:
+        raw.executescript(LEGACY_SCHEMA)
+        raw.executescript(LEGACY_V1_TRIGGERS)
+        for index, (curve_no, sensor_id, points) in enumerate(curves):
+            raw.execute(
+                "INSERT INTO calibration_curves (curve_no, sensor_id, created_at)"
+                " VALUES (?, ?, ?)",
+                (curve_no, sensor_id, f"2026-09-13T0{index}:00:00+00:00"),
+            )
+            raw.executemany(
+                "INSERT INTO calibration_points"
+                " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+                " VALUES (?, ?, ?, ?)",
+                [(curve_no, i, signal, moisture) for i, (signal, moisture) in enumerate(points)],
+            )
+        raw.commit()
+
 POINTS_3 = [("4.0", "0"), ("12.0", "10"), ("20.0", "40")]
 
 
@@ -331,3 +377,83 @@ class TestLegacyDatabaseMigration:
         # 迁移后新建曲线仍走 0 → 1 固化流程，正常可读
         new_curve = repo.create("新探头", POINTS_3)
         assert new_curve.points[0].raw_signal == "4.0"
+
+
+class TestV1DatabaseUpgradeWithTriggers:
+    """带旧触发器（无条件拒绝 UPDATE）的线上 v1 库：升级必须先清旧触发器再回填。"""
+
+    def test_upgrade_opens_existing_curves_and_backfills_sealed(self, tmp_path):
+        db_path = tmp_path / "v1.db"
+        curve_no = "CC20260913-OLD00001"
+        _create_v1_database(
+            db_path,
+            [(curve_no, "旧探头A", [("1", "0"), ("2", "5"), ("3", "40")])],
+        )
+
+        # 回归：旧顺序（先回填 sealed）会被旧 UPDATE 触发器 ABORT，仓储构造失败
+        repo = CalibrationCurveRepository(db_path)
+        record = repo.get(curve_no)
+        assert record.sensor_id == "旧探头A"
+        assert [(p.raw_signal, p.reference_moisture_pct) for p in record.points] == [
+            ("1", "0"), ("2", "5"), ("3", "40"),
+        ]
+        with sqlite3.connect(db_path) as raw:
+            assert raw.execute(
+                "SELECT sealed FROM calibration_curves WHERE curve_no=?", (curve_no,)
+            ).fetchone()[0] == 1
+
+    def test_upgraded_v1_curves_remain_immutable(self, tmp_path):
+        db_path = tmp_path / "v1_immutable.db"
+        curve_no = "CC20260913-OLD00002"
+        _create_v1_database(
+            db_path,
+            [(curve_no, "旧探头B", [("1", "0"), ("2", "5"), ("3", "40")])],
+        )
+        repo = CalibrationCurveRepository(db_path)
+
+        with sqlite3.connect(db_path) as raw:  # 默认不启用外键
+            blocked_statements = [
+                ("UPDATE calibration_curves SET sensor_id='X'", ()),
+                ("UPDATE calibration_curves SET sealed=0 WHERE curve_no=?", (curve_no,)),
+                ("DELETE FROM calibration_curves WHERE curve_no=?", (curve_no,)),
+                ("UPDATE calibration_points SET raw_signal='9'", ()),
+                ("DELETE FROM calibration_points", ()),
+                (
+                    "INSERT INTO calibration_points"
+                    " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+                    " VALUES (?, 3, '9', '40')",
+                    (curve_no,),
+                ),
+            ]
+            for sql, params in blocked_statements:
+                with pytest.raises(sqlite3.IntegrityError):
+                    raw.execute(sql, params)
+                raw.rollback()
+        assert len(repo.get(curve_no).points) == 3
+
+    def test_upgrade_multiple_curves_then_create_and_reopen(self, tmp_path):
+        db_path = tmp_path / "v1_multi.db"
+        curves = [
+            ("CC20260913-OLD00001", "旧探头1", [("1", "0"), ("2", "5"), ("3", "40")]),
+            ("CC20260913-OLD00002", "旧探头2", [("4", "0"), ("8", "5"), ("20", "40")]),
+        ]
+        _create_v1_database(db_path, curves)
+        repo = CalibrationCurveRepository(db_path)
+        assert repo.count_curves() == 2
+        for curve_no, sensor_id, points in curves:
+            record = repo.get(curve_no)
+            assert record.sensor_id == sensor_id
+            assert [(p.raw_signal, p.reference_moisture_pct) for p in record.points] == points
+
+        # 升级后新建曲线走 0 → 1 固化流程，正常写入且立即固化
+        new_curve = repo.create("升级后新探头", POINTS_3)
+        assert repo.count_points(new_curve.curve_no) == len(POINTS_3)
+        with sqlite3.connect(db_path) as raw:
+            assert raw.execute(
+                "SELECT sealed FROM calibration_curves WHERE curve_no=?",
+                (new_curve.curve_no,),
+            ).fetchone()[0] == 1
+
+        # 重复打开（初始化再跑一遍）幂等，旧曲线仍可读
+        CalibrationCurveRepository(db_path)
+        assert repo.get("CC20260913-OLD00001").sensor_id == "旧探头1"

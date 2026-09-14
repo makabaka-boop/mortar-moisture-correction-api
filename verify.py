@@ -24,7 +24,9 @@
    d. 未知曲线：结构化 404；信号越界：定位到 raw_signal 的 422，不做外推；
    e. 不可变：绕过仓储/API 直接 INSERT（追加对照点）/UPDATE/DELETE 同一 SQLite
       文件（含把 sealed 改回 0）均被触发器拒绝，换算依据逐位不变；
-   f. 与取样批次共库迁移：同一文件上两模块表并存，重建仓储仍读到同一曲线。
+   f. 与取样批次共库迁移：同一文件上两模块表并存，重建仓储仍读到同一曲线；
+   g. 旧版校准库（旧触发器、无 sealed 列）升级：先清旧触发器再回填，
+      既有曲线仍可打开/换算且升级后不可追加。
 
 用法：
     python verify.py                 # 默认打 http://localhost:8000
@@ -44,6 +46,10 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
 
 import httpx
+
+from app.calibration_repository import CalibrationCurveRepository
+from app.calibration_schemas import MoistureConversionIn
+from app.calibration_service import convert_signal
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 SHEET_URL = f"{API_BASE_URL}/api/v1/correction-sheet"
@@ -107,6 +113,12 @@ LEGACY_DB_PATH = os.environ.get(
     "LEGACY_SAMPLING_DB_PATH",
     os.path.join(os.path.dirname(SAMPLING_DB_PATH), "legacy_moisture_batches.db"),
 )
+# 引入 sealed 之前的校准库（带旧触发器）：升级回归，与生产主库同目录的独立文件
+LEGACY_CALIBRATION_DB_PATH = os.environ.get(
+    "LEGACY_CALIBRATION_DB_PATH",
+    os.path.join(os.path.dirname(SAMPLING_DB_PATH), "legacy_calibration_curves.db"),
+)
+LEGACY_CALIBRATION_CURVE_NO = "CC20260913-LEGACY01"
 
 Q3 = Decimal("0.001")
 Q6 = Decimal("0.000001")
@@ -317,6 +329,61 @@ def create_legacy_sampling_database() -> str:
         )
         raw.commit()
     return batch_no
+
+
+def create_legacy_calibration_database() -> str:
+    """按引入 sealed 之前的线上版本造校准库：旧两表 + 四个旧触发器 + 已固化曲线。
+
+    旧 UPDATE 触发器无条件 ABORT 一切更新；升级若先回填 sealed=1 会被它拦截，
+    导致带曲线的旧库打不开。验收服务（与 API 同卷同目录）在启动 API 前造好，
+    仓储首次初始化时按“先清旧触发器 → 回填 sealed → 建新触发器”完成升级。
+    """
+    from app.calibration_repository import LEGACY_SCHEMA as CAL_LEGACY_SCHEMA
+
+    parent = os.path.dirname(LEGACY_CALIBRATION_DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if os.path.exists(LEGACY_CALIBRATION_DB_PATH):
+        os.remove(LEGACY_CALIBRATION_DB_PATH)
+    legacy_triggers = """
+    CREATE TRIGGER trg_calibration_curves_no_update
+    BEFORE UPDATE ON calibration_curves
+    BEGIN
+        SELECT RAISE(ABORT, '校准曲线为不可变记录，禁止更新');
+    END;
+    CREATE TRIGGER trg_calibration_curves_no_delete
+    BEFORE DELETE ON calibration_curves
+    BEGIN
+        SELECT RAISE(ABORT, '校准曲线为不可变记录，禁止删除');
+    END;
+    CREATE TRIGGER trg_calibration_points_no_update
+    BEFORE UPDATE ON calibration_points
+    BEGIN
+        SELECT RAISE(ABORT, '校准曲线为不可变记录，对照点禁止更新');
+    END;
+    CREATE TRIGGER trg_calibration_points_no_delete
+    BEFORE DELETE ON calibration_points
+    BEGIN
+        SELECT RAISE(ABORT, '校准曲线为不可变记录，对照点禁止删除');
+    END;
+    """
+    points = [("1", "0"), ("2", "5"), ("3", "40")]
+    with sqlite3.connect(LEGACY_CALIBRATION_DB_PATH) as raw:
+        raw.executescript(CAL_LEGACY_SCHEMA)
+        raw.executescript(legacy_triggers)
+        raw.execute(
+            "INSERT INTO calibration_curves (curve_no, sensor_id, created_at)"
+            " VALUES (?, '旧版探头', '2026-09-13T00:00:00+00:00')",
+            (LEGACY_CALIBRATION_CURVE_NO,),
+        )
+        raw.executemany(
+            "INSERT INTO calibration_points"
+            " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+            " VALUES (?, ?, ?, ?)",
+            [(LEGACY_CALIBRATION_CURVE_NO, i, s, m) for i, (s, m) in enumerate(points)],
+        )
+        raw.commit()
+    return LEGACY_CALIBRATION_CURVE_NO
 
 
 def verify_sampling_batch() -> bool:
@@ -641,9 +708,54 @@ def verify_sampling_batch() -> bool:
 
 def verify_calibration_curve() -> bool:
     """校准曲线闭环验收：创建 → 插值/端点 → 非法点集不落库 → 404/422 → 不可变 → 共库重建。"""
-    # 创建前记录库内曲线数（与取样批次共库），用于核对非法点集不落库
-    from app.calibration_repository import CalibrationCurveRepository
+    # 0) 旧版（带无条件拒绝 UPDATE 的旧触发器、无 sealed 列）校准库升级。
+    #    仓储初始化顺序必须是“先清旧触发器 → 回填 sealed → 建新触发器”：
+    #    回归旧顺序会在回填时被旧触发器 ABORT，带曲线的旧库打不开。
+    #    旧库是独立文件（与主库同卷目录），不混入生产主库。
+    legacy_curve_no = create_legacy_calibration_database()
+    legacy_repo = CalibrationCurveRepository(LEGACY_CALIBRATION_DB_PATH)
+    legacy_record = legacy_repo.get(legacy_curve_no)
+    if legacy_record.sensor_id != "旧版探头" or len(legacy_record.points) != 3:
+        print(f"[verify] FAIL: 升级后旧曲线打不开或数据异常：{legacy_record}", file=sys.stderr)
+        return False
+    # 以服务换算入口（仓储 + 领域插值，与 HTTP 端点同一服务函数）核对升级后换算正确
+    legacy_out = convert_signal(
+        legacy_repo, MoistureConversionIn(curve_no=legacy_curve_no, raw_signal="1.5")
+    )
+    if legacy_out.moisture_pct != "2.500" or legacy_out.interval.lower_signal != "1":
+        print(f"[verify] FAIL: 升级后旧曲线插值异常：{legacy_out}", file=sys.stderr)
+        return False
+    # 主库中查不到旧曲线：独立旧库不应混入生产主库
+    main_missing = httpx.post(
+        CONVERT_URL,
+        json={"curve_no": legacy_curve_no, "raw_signal": "2"},
+        timeout=TIMEOUT,
+    )
+    if main_missing.status_code != 404:
+        print(f"[verify] FAIL: 独立旧库曲线混入主库（应 404）：{main_missing.text}",
+              file=sys.stderr)
+        return False
+    # 升级后的旧曲线同样不可追加、不可解封
+    with sqlite3.connect(LEGACY_CALIBRATION_DB_PATH) as raw:
+        for sql, params in (
+            (
+                "INSERT INTO calibration_points"
+                " (curve_no, ordinal, raw_signal, reference_moisture_pct)"
+                " VALUES (?, 3, '9', '40')",
+                (legacy_curve_no,),
+            ),
+            ("UPDATE calibration_curves SET sealed=0 WHERE curve_no=?", (legacy_curve_no,)),
+        ):
+            try:
+                raw.execute(sql, params)
+                raw.commit()
+                print(f"[verify] FAIL: 升级后的旧曲线可被追加/解封：{sql}", file=sys.stderr)
+                return False
+            except sqlite3.IntegrityError:
+                raw.rollback()
+    print("[verify] 旧版校准库（旧触发器）升级成功：旧曲线可读、换算正确且仍不可追加")
 
+    # 创建前记录库内曲线数（与取样批次共库），用于核对非法点集不落库
     check_repo = CalibrationCurveRepository(SAMPLING_DB_PATH)
     curves_before = check_repo.count_curves()
 
