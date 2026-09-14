@@ -1,5 +1,6 @@
 """取样批次 API 测试：创建/确认契约、完整精度中位数、错误定位与持久化。"""
-from decimal import Decimal, ROUND_HALF_UP, localcontext
+from decimal import Decimal, localcontext
+from fractions import Fraction
 
 import pytest
 from fastapi.testclient import TestClient
@@ -25,18 +26,46 @@ def _confirm_url(batch_no):
     return f"{CREATE_URL}/{batch_no}/confirm"
 
 
+def _independent_precision(raw_values):
+    """独立重写自适应精度估算（与产品公式同数学、不复用代码），供逐位比对。"""
+    decimals = [Decimal(v) for v in raw_values]
+    max_int = max(max(v.adjusted() + 1, 0) for v in decimals)
+    max_frac = max(max(-v.as_tuple().exponent, 0) for v in decimals)
+    max_sig = max(len(v.as_tuple().digits) for v in decimals)
+    return max(50, 2 * (max_int + max_frac + max_sig) + 16)
+
+
 def _independently_expected(readings):
-    """独立复算：同精度 50 位上下文求各组含水率与三位 HALF_UP 中位数。"""
+    """独立复算：自适应精度的各组含水率 + Fraction 严格三位 HALF_UP 中位数。
+
+    逐组串按与产品相同数学的自适应精度复算（逐位可比）；代表值不依赖
+    任何 Decimal 截断精度，以 Fraction 精确有理数判定舍入边界。
+    """
+    raw = [v for pair in readings for v in pair]
+    prec = _independent_precision(raw)
     with localcontext() as ctx:
-        ctx.prec = 50
-        pcts = [
-            (Decimal(w) - Decimal(d)) / Decimal(d) * 100
-            for w, d in readings
-        ]
-    ordered = sorted(pcts)
-    n = len(ordered)
-    median = ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
-    return pcts, median.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+        ctx.prec = prec
+        pcts = [(Decimal(w) - Decimal(d)) / Decimal(d) * 100 for w, d in readings]
+        ordered = sorted(pcts)
+        n = len(ordered)
+        dec_median = (
+            ordered[n // 2]
+            if n % 2
+            else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+        )
+    # Fraction 精确中位数：有限小数输入下无任何截断
+    frac_pcts = sorted(
+        (Fraction(w) - Fraction(d)) / Fraction(d) * 100 for w, d in readings
+    )
+    frac_median = (
+        frac_pcts[n // 2]
+        if n % 2
+        else (frac_pcts[n // 2 - 1] + frac_pcts[n // 2]) / 2
+    )
+    # ROUND_HALF_UP：加 1/2 后向零取整（结果恒正），得到精确千分数 k/1000
+    thousandths = int(frac_median * 1000 + Fraction(1, 2))
+    median3 = (Decimal(thousandths) / Decimal(1000)).quantize(Decimal("0.001"))
+    return pcts, dec_median, median3
 
 
 @pytest.fixture
@@ -183,7 +212,7 @@ class TestConfirm:
         resp = client.post(_confirm_url(batch_no))
         assert resp.status_code == 200
         body = resp.json()
-        pcts, median3 = _independently_expected(self.THREE)
+        pcts, _dec_median, median3 = _independently_expected(self.THREE)
         assert body["status"] == STATUS_CONFIRMED
         assert body["representative_moisture_pct"] == f"{median3:f}"
         assert body["confirmed_at"]
@@ -200,7 +229,7 @@ class TestConfirm:
         # 5、3、3.333…、5.263… → 中位两项 3.333… 与 5 的平均
         batch_no = self._create_batch(sampling_repo, readings)
         body = client.post(_confirm_url(batch_no)).json()
-        _, median3 = _independently_expected(readings)
+        _, _, median3 = _independently_expected(readings)
         assert body["representative_moisture_pct"] == f"{median3:f}"
 
     def test_median_round_half_up_at_fourth_decimal(self, sampling_repo):
@@ -214,8 +243,51 @@ class TestConfirm:
         batch_no = self._create_batch(sampling_repo, readings)
         body = client.post(_confirm_url(batch_no)).json()
         assert body["representative_moisture_pct"] == "5.124"
-        _, median3 = _independently_expected(readings)
+        _, _, median3 = _independently_expected(readings)
         assert str(median3) == "5.124"
+
+    @pytest.mark.parametrize("gap_exp", [52, 100, 200])
+    def test_high_precision_value_just_below_rounding_boundary(self, sampling_repo, gap_exp):
+        # 回归：真实中位数 = 1.2345 − 1e-gap_exp，固定 50 位截断会越过边界误进位为 1.235
+        with localcontext() as ctx:
+            ctx.prec = gap_exp + 200
+            target = Decimal("1.2345") - Decimal(10) ** -gap_exp
+
+            def wet(pct: Decimal) -> str:
+                return format(Decimal("1") + pct / 100, "f")
+
+            readings = [
+                (wet(Decimal("0.5")), "1"),  # 0.5%
+                (wet(target), "1"),          # 1.2344999…%（边界下侧）
+                (wet(Decimal("2")), "1"),    # 2%
+            ]
+        batch_no = self._create_batch(sampling_repo, readings)
+        body = client.post(_confirm_url(batch_no)).json()
+        _, dec_median, median3 = _independently_expected(readings)
+        assert Fraction(dec_median) < Fraction("1.2345")
+        assert str(median3) == "1.234"
+        assert body["representative_moisture_pct"] == "1.234"
+        # 完整精度结果保留了超过 50 位的尾数位（没有被截断成 1.2345）
+        middle_pct = body["readings"][1]["moisture_pct"]
+        assert Decimal(middle_pct) < Decimal("1.2345")
+        assert "4999" in middle_pct
+
+    def test_high_precision_value_just_above_rounding_boundary_rounds_up(self, sampling_repo):
+        with localcontext() as ctx:
+            ctx.prec = 300
+            target = Decimal("1.2345") + Decimal(10) ** -100
+
+            def wet(pct: Decimal) -> str:
+                return format(Decimal("1") + pct / 100, "f")
+
+            readings = [
+                (wet(Decimal("0.5")), "1"),
+                (wet(target), "1"),
+                (wet(Decimal("2")), "1"),
+            ]
+        batch_no = self._create_batch(sampling_repo, readings)
+        body = client.post(_confirm_url(batch_no)).json()
+        assert body["representative_moisture_pct"] == "1.235"
 
     def test_unknown_batch_returns_structured_404(self, sampling_repo):
         resp = client.post(_confirm_url("MC19990101-00000000"))
@@ -259,7 +331,7 @@ class TestConfirm:
         ]
         batch_no = self._create_batch(sampling_repo, readings)
         body = client.post(_confirm_url(batch_no)).json()
-        pcts, median3 = _independently_expected(readings)
+        pcts, _dec_median, median3 = _independently_expected(readings)
         assert [r["moisture_pct"] for r in body["readings"]] == [format(p, "f") for p in pcts]
         assert body["representative_moisture_pct"] == f"{median3:f}"
 
